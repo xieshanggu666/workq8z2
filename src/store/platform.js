@@ -93,6 +93,17 @@ export const AFTERSALE_STATUS = {
   dismissed: { label: '已驳回', tone: 'muted' }
 }
 
+// 采购单状态文案与样式标记
+// pending 待审批 → approved 待入库（审批通过）/ rejected 已驳回（终态）
+// approved → partial 部分入库（分批验收）→ done 已完成（全部验收入库，终态）
+export const PURCHASE_STATUS = {
+  pending: { label: '待审批', tone: 'warn' },
+  approved: { label: '待入库', tone: 'info' },
+  partial: { label: '部分入库', tone: 'info' },
+  done: { label: '已完成', tone: 'ok' },
+  rejected: { label: '已驳回', tone: 'muted' }
+}
+
 // 卡券账户实例状态文案与样式标记
 // available 待核销（发券即入账）→ redeemed 已核销（运营扫码核销）/ expired 已过期（到期扫描）
 // 风控冻结期不生成券账户实例（库存预占）：放行后发券交付，撤销则库存回补、券始终不发出
@@ -118,6 +129,7 @@ export const AUDIT_MODULES = {
   risk: '风控申诉',
   ship: '物流发货',
   aftersale: '售后闭环',
+  purchase: '采购入库',
   coupon: '卡券核销',
   recon: '积分库存对账',
   system: '系统'
@@ -131,6 +143,7 @@ const ACTION_MODULE_PREFIX = [
   ['freeze', 'risk'], ['release', 'risk'], ['revoke', 'risk'], ['appeal', 'risk'], ['config', 'risk'],
   ['ship-', 'ship'],
   ['aftersale-', 'aftersale'],
+  ['purchase-', 'purchase'],
   ['coupon-', 'coupon'],
   ['recon-', 'recon'],
   ['day-rollover', 'system']
@@ -162,6 +175,7 @@ export const usePlatformStore = defineStore('platform', {
     taskClaims: [],             // 任务领奖台账（append-only）：{ taskId, bizDate 归属业务日, grantDate 实际发放日, reward, flowId }，发奖与补偿的统一判重依据
     riskOrders: [],             // 风控审核单
     afterSales: [],             // 售后单（append-only）：拒收/退货/补发申请与审核回写留痕
+    purchaseOrders: [],         // 采购单（append-only）：奖品/商品采购申请 → 审批 → 分批验收入库，批次台账挂在单上
     auditLogs: [],              // 操作记录（审计日志）
     reconBills: [],             // 积分库存对账差异单（按业务日，append-only 保留执行/复核/补偿痕迹）
     stockAdjustments: [],       // 库存校正台账（append-only）：对账补偿对 remain 的修正凭证
@@ -325,6 +339,19 @@ export const usePlatformStore = defineStore('platform', {
           afterSaleDone: s.afterSales.filter((a) => inT(a) && a.status === 'done').length,
           afterSaleDismissed: s.afterSales.filter((a) => inT(a) && a.status === 'dismissed').length,
           shipReshipped: s.shipments.filter((o) => inT(o) && o.source === '售后补发').length,
+          // 采购看板：待审批 / 待入库（含部分入库）/ 已完成 / 累计入库件数 / 缺货待履约补发
+          poPending: s.purchaseOrders.filter((p) => inT(p) && p.status === 'pending').length,
+          poReceiving: s.purchaseOrders.filter((p) => inT(p) && (p.status === 'approved' || p.status === 'partial')).length,
+          poDone: s.purchaseOrders.filter((p) => inT(p) && p.status === 'done').length,
+          poInboundQty: s.purchaseOrders.filter((p) => inT(p) && p.status !== 'rejected')
+            .reduce((n, p) => n + p.items.reduce((q, it) => q + (it.receivedQty || 0), 0), 0),
+          poShortReship: s.afterSales.filter((a) => inT(a) && a.status === 'pending' && a.type === 'reship')
+            .filter((a) => {
+              const t = a.targetType === 'prize'
+                ? s.activities.find((x) => x.id === a.activityId)?.prizes.find((p) => p.id === a.targetId)
+                : s.goods.find((g) => g.id === a.targetId)
+              return !t || t.remain <= 0
+            }).length,
           // 卡券看板：累计发券 / 待核销 / 已核销 / 已过期 / 风控预占待交付
           couponIssued: s.coupons.filter(inT).length,
           couponAvailable: s.coupons.filter((c) => inT(c) && c.status === 'available').length,
@@ -447,6 +474,65 @@ export const usePlatformStore = defineStore('platform', {
       return s.afterSales.filter(
         (a) => a.userId === s.user.id && (a.tenantId || 't-star') === s.activeTenantId && a.status === 'pending'
       ).length
+    },
+    // ===== 采购入库 =====
+    // 当前租户内采购单（最新在前）
+    scopedPurchaseOrders(s) {
+      return [...s.purchaseOrders]
+        .filter((p) => (p.tenantId || 't-star') === s.activeTenantId)
+        .sort((a, b) => b.ts - a.ts)
+    },
+    // 采购看板统计（按当前租户）：各状态单量 + 累计入库件数 + 缺货待履约补发
+    purchaseStats(s) {
+      const list = s.purchaseOrders.filter((p) => (p.tenantId || 't-star') === s.activeTenantId)
+      const qtyOf = (p) => p.items.reduce((n, it) => n + it.qty, 0)
+      const receivedOf = (p) => p.items.reduce((n, it) => n + (it.receivedQty || 0), 0)
+      return {
+        total: list.length,
+        pending: list.filter((p) => p.status === 'pending').length,
+        approved: list.filter((p) => p.status === 'approved').length,
+        partial: list.filter((p) => p.status === 'partial').length,
+        done: list.filter((p) => p.status === 'done').length,
+        rejected: list.filter((p) => p.status === 'rejected').length,
+        orderedQty: list.filter((p) => p.status !== 'rejected').reduce((n, p) => n + qtyOf(p), 0),
+        inboundQty: list.filter((p) => p.status !== 'rejected').reduce((n, p) => n + receivedOf(p), 0),
+        shortReship: this.shortReshipAfterSales.length
+      }
+    },
+    // 运营采购待办角标：待审批 + 待入库/部分入库（按当前租户）
+    pendingPurchaseCount(s) {
+      return s.purchaseOrders.filter(
+        (p) => (p.tenantId || 't-star') === s.activeTenantId &&
+          ['pending', 'approved', 'partial'].includes(p.status)
+      ).length
+    },
+    // 缺货待补货的补发售后单（待审核且目标库存 remain<=0）——按当前租户
+    shortReshipAfterSales(s) {
+      return s.afterSales.filter((a) =>
+        (a.tenantId || 't-star') === s.activeTenantId &&
+        a.status === 'pending' && a.type === 'reship' &&
+        (() => { const t = this._stockTargetOf(a); return !t || t.remain <= 0 })()
+      )
+    },
+    // 库存已补足、可继续履约的待审核补发售后单——按当前租户
+    fulfillableReshipAfterSales(s) {
+      return s.afterSales.filter((a) =>
+        (a.tenantId || 't-star') === s.activeTenantId &&
+        a.status === 'pending' && a.type === 'reship' &&
+        (() => { const t = this._stockTargetOf(a); return !!t && t.remain > 0 })()
+      )
+    },
+    // 某库存目标的累计采购入库量（已验收批次；对账 P5 展示"期初 = 总库存 − 累计入库"用）
+    inboundOfTarget: (s) => (targetType, activityId, targetId, tenantId = s.activeTenantId) => {
+      let total = 0
+      s.purchaseOrders.forEach((p) => {
+        if ((p.tenantId || 't-star') !== tenantId) return
+        p.batches.forEach((b) => b.lines.forEach((l) => {
+          if (l.targetType === targetType && l.targetId === targetId &&
+            (targetType !== 'prize' || l.activityId === activityId)) total += l.qty
+        }))
+      })
+      return total
     },
     // ===== 卡券账户 =====
     // 卡券模板（按 id 索引；含两个租户的全部模板）
@@ -941,6 +1027,10 @@ export const usePlatformStore = defineStore('platform', {
           'aftersale-apply': '售后申请',
           'aftersale-approve': '售后审核通过',
           'aftersale-dismiss': '售后驳回',
+          'purchase-create': '发起采购',
+          'purchase-approve': '采购审批通过',
+          'purchase-reject': '采购驳回',
+          'purchase-receive': '分批验收入库',
           'coupon-issue': '卡券发放',
           'coupon-hold': '卡券预占',
           'coupon-deliver': '放行发券',
@@ -1898,7 +1988,7 @@ export const usePlatformStore = defineStore('platform', {
       const target = this._stockTargetOf(as)
       if (!target) { this.showToast('关联库存目标缺失，无法执行回写', 'warn'); this.endTrace(); return false }
       if (as.type === 'reship' && target.remain <= 0) {
-        this.showToast(`补发失败：【${as.targetName}】库存不足（remain=0），请先补货或驳回该申请`, 'warn')
+        this.showToast(`补发失败：【${as.targetName}】库存不足（remain=0），可在「采购入库」发起采购补货后再从待处理售后继续履约，或驳回该申请`, 'warn')
         this.endTrace()
         return false
       }
@@ -1961,6 +2051,198 @@ export const usePlatformStore = defineStore('platform', {
         'success')
       this.endTrace()
       return true
+    },
+
+    // ===== 采购入库：发起 → 审批 → 分批验收入库 =====
+    // 状态机：pending 待审批 → approved 待入库 / rejected 已驳回（终态）；
+    //        approved → partial 部分入库 → done 已完成（全部验收入库，终态）。
+    // 入库口径：验收批次落账即 奖品/商品 stock 与 remain 同步 += 验收数量（P5 账实勾稽
+    //          应有 = 总库存 − 有效消耗 + 校正 两侧同步，天然平衡），批次 append-only 挂在采购单上。
+    // 职责分离（RBAC）：purchase:create 发起（活动运营）/ purchase:review 审批（财务对账）/
+    //          purchase:receive 验收入库（物流客服）；组织管理员与平台超管全权。
+    // 售后联动：补发售后因缺货被拦截后保持待审核，采购入库补足库存即可从待处理售后继续履约。
+
+    // 采购明细行对应的库存目标（奖品按 活动+奖品 定位，商品按 goodsId）
+    _purchaseTargetOf(line) {
+      return line.targetType === 'prize'
+        ? this.activities.find((a) => a.id === line.activityId)?.prizes.find((p) => p.id === line.targetId) || null
+        : this.goods.find((g) => g.id === line.targetId) || null
+    },
+    // 采购单剩余待入库数量（按行）
+    _purchaseRemaining(po) {
+      return po.items.map((it) => ({ ...it, remaining: it.qty - (it.receivedQty || 0) }))
+    },
+
+    // 运营发起采购（RBAC：purchase:create；仅本租户奖品/商品；多明细行）
+    // items: [{ targetType: 'prize'|'goods', activityId, targetId, qty }]
+    createPurchaseOrder({ items = [], note = '' } = {}) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      if (!this.requirePerm('purchase:create', 'purchase')) { this.endTrace(); return null }
+      const tid = this.activeTenantId
+      if (!this.requireSameTenant(tid, 'purchase')) { this.endTrace(); return null }
+      if (!items.length) { this.showToast('请至少添加一行采购明细', 'warn'); this.endTrace(); return null }
+      // 逐行校验：目标存在且归属当前租户、数量为正整数；同一目标合并计一行
+      const merged = new Map()
+      for (const raw of items) {
+        const qty = Math.floor(Number(raw.qty))
+        if (!Number.isFinite(qty) || qty <= 0) {
+          this.showToast('采购数量须为正整数', 'warn'); this.endTrace(); return null
+        }
+        const line = {
+          targetType: raw.targetType,
+          activityId: raw.targetType === 'prize' ? raw.activityId : null,
+          targetId: raw.targetId
+        }
+        const target = this._purchaseTargetOf(line)
+        if (!target) { this.showToast('采购目标不存在，请重新选择', 'warn'); this.endTrace(); return null }
+        // 租户归属强校验：奖品按活动归属、商品按 tenantId
+        const owner = line.targetType === 'prize'
+          ? this.activities.find((a) => a.id === line.activityId)?.tenantId
+          : target.tenantId
+        if ((owner || 't-star') !== tid) {
+          this.deny('cross-tenant-denied', `越权采购其他租户商品被拦截（${target.name}）`, { module: 'purchase', tenantId: tid, traceId: trace })
+          this.endTrace(); return null
+        }
+        const key = line.targetType === 'prize' ? `prize:${line.activityId}:${line.targetId}` : `goods:${line.targetId}`
+        const name = line.targetType === 'prize'
+          ? `${this.activities.find((a) => a.id === line.activityId)?.name} / ${target.name}`
+          : target.name
+        const icon = line.targetType === 'prize' ? target.emoji : target.icon
+        const prev = merged.get(key)
+        if (prev) prev.qty += qty
+        else merged.set(key, { ...line, targetName: name, icon, qty, receivedQty: 0 })
+      }
+      const po = {
+        id: genId('po'),
+        tenantId: tid,
+        traceId: trace,
+        status: 'pending',
+        items: [...merged.values()],
+        note: (note || '').trim(),
+        applicant: this.user.name,
+        applicantId: this.currentMemberId || this.user.id,
+        createdAt: this.todayDate, createdTime: nowTime(), ts: Date.now(),
+        reviewedAt: '', reviewer: '', reviewNote: '',
+        batches: []               // 验收入库批次（append-only）：{ id, at, operator, note, lines:[{…,qty}] }
+      }
+      this.purchaseOrders.unshift(po)
+      const summary = po.items.map((it) => `${it.targetName}×${it.qty}`).join('、')
+      this.addAuditLog('purchase-create', po.id,
+        `发起采购【${summary}】${po.note ? `；说明：${po.note}` : ''}，待采购审批`,
+        { module: 'purchase', tenantId: tid, traceId: trace })
+      this.showToast(`🛒 采购单已提交（${po.items.length} 个品类），等待审批`, 'success')
+      this.endTrace()
+      return po
+    },
+
+    // 采购审批（RBAC：purchase:review；仅 pending 可审；驳回不动库存）
+    reviewPurchaseOrder(poId, approve, note = '') {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const po = this.purchaseOrders.find((x) => x.id === poId)
+      if (!po) { this.endTrace(); return false }
+      if (!this.requirePerm('purchase:review', 'purchase') || !this.requireSameTenant(po.tenantId, 'purchase')) {
+        this.endTrace(); return false
+      }
+      if (po.status !== 'pending') {
+        this.showToast('该采购单已审批，请勿重复操作', 'warn'); this.endTrace(); return false
+      }
+      const remark = (note || '').trim()
+      const summary = po.items.map((it) => `${it.targetName}×${it.qty}`).join('、')
+      if (!approve) {
+        po.status = 'rejected'
+        po.reviewedAt = `${this.todayDate} ${nowTime()}`
+        po.reviewer = this.user.name
+        po.reviewNote = remark
+        this.addAuditLog('purchase-reject', po.id,
+          `驳回采购单【${summary}】（申请人 ${po.applicant}）${remark ? '；意见：' + remark : ''}；库存未变动`,
+          { module: 'purchase', tenantId: po.tenantId, traceId: trace })
+        this.showToast('已驳回该采购单', 'info')
+        this.endTrace()
+        return true
+      }
+      po.status = 'approved'
+      po.reviewedAt = `${this.todayDate} ${nowTime()}`
+      po.reviewer = this.user.name
+      po.reviewNote = remark
+      this.addAuditLog('purchase-approve', po.id,
+        `采购审批通过【${summary}】（申请人 ${po.applicant}）${remark ? '；意见：' + remark : ''}，进入待入库`,
+        { module: 'purchase', tenantId: po.tenantId, traceId: trace })
+      this.showToast('✅ 采购审批通过，可分批验收入库', 'success')
+      this.endTrace()
+      return true
+    },
+
+    // 分批验收入库（RBAC：purchase:receive；approved/partial 可验收；每行数量 ≤ 剩余待入库）
+    // lines: [{ targetType, activityId, targetId, qty }]；落账：stock/remain 同步 += qty，批次 append-only
+    receivePurchaseBatch(poId, lines = [], note = '') {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const po = this.purchaseOrders.find((x) => x.id === poId)
+      if (!po) { this.endTrace(); return false }
+      if (!this.requirePerm('purchase:receive', 'purchase') || !this.requireSameTenant(po.tenantId, 'purchase')) {
+        this.endTrace(); return false
+      }
+      if (po.status !== 'approved' && po.status !== 'partial') {
+        this.showToast(po.status === 'pending' ? '采购单尚未审批通过，不能验收入库' : '该采购单不可再验收', 'warn')
+        this.endTrace(); return false
+      }
+      // 逐行校验：目标存在、数量为正且不超过剩余待入库（任一不满足整体不落账）
+      const received = []
+      for (const raw of lines) {
+        const qty = Math.floor(Number(raw.qty))
+        if (!Number.isFinite(qty) || qty <= 0) continue // 0/空行视为本批不验收该明细
+        const item = po.items.find((it) => it.targetType === raw.targetType && it.targetId === raw.targetId &&
+          (it.targetType !== 'prize' || it.activityId === raw.activityId))
+        if (!item) { this.showToast('验收明细与采购单不符，已拦截', 'warn'); this.endTrace(); return false }
+        const remaining = item.qty - (item.receivedQty || 0)
+        if (qty > remaining) {
+          this.showToast(`【${item.targetName}】验收 ${qty} 超出剩余待入库 ${remaining}，已拦截`, 'warn')
+          this.endTrace(); return false
+        }
+        const target = this._purchaseTargetOf(item)
+        if (!target) { this.showToast(`【${item.targetName}】库存目标缺失，无法入库`, 'warn'); this.endTrace(); return false }
+        received.push({ item, target, qty })
+      }
+      if (!received.length) { this.showToast('请填写本批验收数量（至少一行大于 0）', 'warn'); this.endTrace(); return false }
+
+      // 落账：库存目标 stock/remain 同步增加（P5 勾稽两侧同步，账实保持平衡）
+      received.forEach(({ item, target, qty }) => {
+        target.stock += qty
+        target.remain += qty
+        item.receivedQty = (item.receivedQty || 0) + qty
+      })
+      const batch = {
+        id: genId('pb'),
+        at: `${this.todayDate} ${nowTime()}`,
+        date: this.todayDate, time: nowTime(), ts: Date.now(),
+        operator: this.user.name,
+        note: (note || '').trim(),
+        lines: received.map(({ item, qty }) => ({
+          targetType: item.targetType, activityId: item.activityId, targetId: item.targetId,
+          targetName: item.targetName, icon: item.icon, qty
+        }))
+      }
+      po.batches.push(batch)
+      const allDone = po.items.every((it) => (it.receivedQty || 0) >= it.qty)
+      po.status = allDone ? 'done' : 'partial'
+      const summary = batch.lines.map((l) => `${l.targetName}×${l.qty}`).join('、')
+      this.addAuditLog('purchase-receive', po.id,
+        `分批验收入库【${summary}】（第 ${po.batches.length} 批）${batch.note ? `；备注：${batch.note}` : ''}；` +
+        `累计入库 ${po.items.reduce((n, it) => n + (it.receivedQty || 0), 0)}/${po.items.reduce((n, it) => n + it.qty, 0)} 件，` +
+        `库存账面同步增加${allDone ? '，采购单已完成' : '，剩余待入库可继续验收'}`,
+        { module: 'purchase', tenantId: po.tenantId, traceId: trace })
+
+      // 售后联动：入库后检测待审核补发单，库存已补足的可从待处理售后继续履约
+      const fulfillable = this.fulfillableReshipAfterSales
+      this.showToast(
+        `📥 第 ${po.batches.length} 批验收入库完成【${summary}】` +
+        (allDone ? '，采购单已全部入库' : '') +
+        (fulfillable.length ? `；${fulfillable.length} 笔待处理补发售后库存已补足，可继续履约` : ''),
+        'success')
+      this.endTrace()
+      return batch
     },
 
     // ===== 卡券账户与核销 =====
@@ -2446,8 +2728,22 @@ export const usePlatformStore = defineStore('platform', {
 
       // —— P5 库存账实（当前态；应有 = 初始库存 - 有效消耗 + 已校正） ——
       // 有效消耗含售后修正：已完成的拒收/退货回补库存（消耗 -1），已完成的补发再消耗（+1）
+      // 采购入库：验收批次落账即同步增加总库存 stock 与 remain（两侧同步、账实天然平衡），
+      //          行内展示"期初 = 总库存 − 累计入库"与当日入库量，便于追溯库存来源
       const consumedAllOf = (test) => recordsT.filter((r) => r.status !== 'revoked' && test(r)).length
       const doneAfterSales = afterSalesT.filter((a) => a.status === 'done')
+      const posT = this.purchaseOrders.filter(inT)
+      const inboundQtyOf = (targetType, activityId, targetId, forDate = null) => {
+        let total = 0
+        posT.forEach((p) => p.batches.forEach((b) => {
+          if (forDate && b.date !== forDate) return
+          b.lines.forEach((l) => {
+            if (l.targetType === targetType && l.targetId === targetId &&
+              (targetType !== 'prize' || l.activityId === activityId)) total += l.qty
+          })
+        }))
+        return total
+      }
       const afterSaleOf = (targetType, activityId, targetId) => {
         const hit = doneAfterSales.filter((a) => a.targetType === targetType &&
           a.targetId === targetId && (targetType !== 'prize' || a.activityId === activityId))
@@ -2484,12 +2780,15 @@ export const usePlatformStore = defineStore('platform', {
             (targetType !== 'prize' || a.activityId === activityId) &&
             (a.reviewedAt || '').slice(0, 10) === date)
           .reduce((n, a) => n + (a.type === 'reship' ? 1 : -1), 0)
-        if (diff !== 0 || dayConsumed !== 0 || dayAfterSale !== 0) {
+        const inbound = inboundQtyOf(targetType, activityId, id)
+        const dayInbound = inboundQtyOf(targetType, activityId, id, date)
+        if (diff !== 0 || dayConsumed !== 0 || dayAfterSale !== 0 || dayInbound !== 0) {
           stockItems.push({
             key: `stock-${heldKey}`, targetType, activityId, targetId: id, targetKey: heldKey,
             name, icon,
             stock: item.stock, consumed, adjusted, expected, actual: item.remain,
             diff, dayConsumed: dayConsumed + dayAfterSale,
+            inbound, dayInbound,
             asReturned: asFix.returned, asReshipped: asFix.reshipped,
             frozenHeld: heldByTarget.get(heldKey) || 0, frozenBook: item.frozen || 0,
             autoFixable: diff !== 0
@@ -3613,7 +3912,71 @@ export const usePlatformStore = defineStore('platform', {
         { id: 'seed-log7', action: 'task-settle', actionLabel: '任务结算', orderId: '', operator: '系统', detail: `抽奖任务【今日抽奖3次】达成（${d2} 有效参与 3/3），自动发放 15 积分`, date: d2, time: '08:12:40' }
       ]
 
-      // —— 11) 星河商贸种子数据统一补打租户/追踪标记（历史种子按默认租户 t-star 归属） ——
+      // —— 11) 采购入库种子：已完成（两批入库）/ 部分入库 / 待审批 / 已驳回 ——
+      // 入库批次不重复落账：种子总库存 stock 已含累计入库量（期初 = stock − 累计入库），
+      // 后续通过「分批验收入库」新验收的批次才会实时 stock/remain 同步增加
+      // 11a) 已完成：定制保温杯 100 件分两批验收入库（期初 50 + 入库 100 = 当前总库存 150）
+      this.purchaseOrders.push({
+        id: 'seed-po1', tenantId: 't-star', traceId: '',
+        status: 'done',
+        items: [{ targetType: 'prize', activityId: 'act-1', targetId: 'p3', targetName: '周年庆幸运转盘 / 定制保温杯', icon: '☕', qty: 100, receivedQty: 100 }],
+        note: '周年庆活动奖品集中采购补货',
+        applicant: '运营小张', applicantId: 'm-star-ops',
+        createdAt: d2, createdTime: '09:05:12', ts: todayAt(9, 5) - 2 * DAY,
+        reviewedAt: `${d2} 10:11:30`, reviewer: '财务小周', reviewNote: '预算内常规补货，同意采购',
+        batches: [
+          { id: 'seed-pb1a', at: `${d2} 15:20:00`, date: d2, time: '15:20:00', ts: todayAt(15, 20) - 2 * DAY, operator: '仓配小李', note: '首批到货 60 件，验收合格', lines: [{ targetType: 'prize', activityId: 'act-1', targetId: 'p3', targetName: '周年庆幸运转盘 / 定制保温杯', icon: '☕', qty: 60 }] },
+          { id: 'seed-pb1b', at: `${d1} 10:40:00`, date: d1, time: '10:40:00', ts: todayAt(10, 40) - DAY, operator: '仓配小李', note: '尾批到货 40 件，验收合格，采购单完成', lines: [{ targetType: 'prize', activityId: 'act-1', targetId: 'p3', targetName: '周年庆幸运转盘 / 定制保温杯', icon: '☕', qty: 40 }] }
+        ]
+      })
+      // 11b) 部分入库：定制帆布袋 100 件（已入库 40、待入库 60；期初 10 + 入库 40 = 当前总库存 50）
+      this.purchaseOrders.push({
+        id: 'seed-po2', tenantId: 't-star', traceId: '',
+        status: 'partial',
+        items: [{ targetType: 'goods', activityId: null, targetId: 'g3', targetName: '定制帆布袋', icon: '👜', qty: 100, receivedQty: 40 }],
+        note: '商城热销品补货，供应商分两批到货',
+        applicant: '运营小张', applicantId: 'm-star-ops',
+        createdAt: d1, createdTime: '11:02:40', ts: todayAt(11, 2) - DAY,
+        reviewedAt: `${d1} 14:25:06`, reviewer: '财务小周', reviewNote: '同意，按到货批次验收',
+        batches: [
+          { id: 'seed-pb2a', at: `${d1} 16:30:00`, date: d1, time: '16:30:00', ts: todayAt(16, 30) - DAY, operator: '仓配小李', note: '首批 40 件验收合格入库，尾批 60 件待到货', lines: [{ targetType: 'goods', activityId: null, targetId: 'g3', targetName: '定制帆布袋', icon: '👜', qty: 40 }] }
+        ]
+      })
+      // 11c) 待审批：iPhone 16 ×5 + 盲盒福袋 ×20（高价值奖品与热销品补货，待财务审批）
+      this.purchaseOrders.push({
+        id: 'seed-po3', tenantId: 't-star', traceId: '',
+        status: 'pending',
+        items: [
+          { targetType: 'prize', activityId: 'act-1', targetId: 'p1', targetName: '周年庆幸运转盘 / iPhone 16', icon: '📱', qty: 5, receivedQty: 0 },
+          { targetType: 'goods', activityId: null, targetId: 'g4', targetName: '盲盒福袋', icon: '🎁', qty: 20, receivedQty: 0 }
+        ],
+        note: '周年庆高价值奖品与商城热销品补货，请财务审批预算',
+        applicant: '运营小张', applicantId: 'm-star-ops',
+        createdAt: this.todayDate, createdTime: '10:35:00', ts: todayAt(10, 35),
+        reviewedAt: '', reviewer: '', reviewNote: '',
+        batches: []
+      })
+      // 11d) 已驳回：500元购物卡 ×50（预算不足驳回，库存未变动）
+      this.purchaseOrders.push({
+        id: 'seed-po4', tenantId: 't-star', traceId: '',
+        status: 'rejected',
+        items: [{ targetType: 'prize', activityId: 'act-1', targetId: 'p2', targetName: '周年庆幸运转盘 / 500元购物卡', icon: '💳', qty: 50, receivedQty: 0 }],
+        note: '购物卡批量采购申请',
+        applicant: '运营小张', applicantId: 'm-star-ops',
+        createdAt: d1, createdTime: '09:20:00', ts: todayAt(9, 20) - DAY,
+        reviewedAt: `${d1} 11:00:00`, reviewer: '财务小周', reviewNote: '本月采购预算已用尽，请下月重新提报',
+        batches: []
+      })
+      this.auditLogs.push(
+        { id: 'seed-log-po1', action: 'purchase-create', actionLabel: '发起采购', orderId: 'seed-po3', operator: '运营小张', detail: '发起采购【周年庆幸运转盘 / iPhone 16×5、盲盒福袋×20】；说明：周年庆高价值奖品与商城热销品补货，请财务审批预算，待采购审批', date: this.todayDate, time: '10:35:00' },
+        { id: 'seed-log-po2', action: 'purchase-receive', actionLabel: '分批验收入库', orderId: 'seed-po2', operator: '仓配小李', detail: `分批验收入库【定制帆布袋×40】（第 1 批）；备注：首批 40 件验收合格入库，尾批 60 件待到货；累计入库 40/100 件，库存账面同步增加，剩余待入库可继续验收`, date: d1, time: '16:30:00' },
+        { id: 'seed-log-po3', action: 'purchase-approve', actionLabel: '采购审批通过', orderId: 'seed-po2', operator: '财务小周', detail: '采购审批通过【定制帆布袋×100】（申请人 运营小张）；意见：同意，按到货批次验收，进入待入库', date: d1, time: '14:25:06' },
+        { id: 'seed-log-po4', action: 'purchase-reject', actionLabel: '采购驳回', orderId: 'seed-po4', operator: '财务小周', detail: '驳回采购单【周年庆幸运转盘 / 500元购物卡×50】（申请人 运营小张）；意见：本月采购预算已用尽，请下月重新提报；库存未变动', date: d1, time: '11:00:00' },
+        { id: 'seed-log-po5', action: 'purchase-receive', actionLabel: '分批验收入库', orderId: 'seed-po1', operator: '仓配小李', detail: '分批验收入库【周年庆幸运转盘 / 定制保温杯×40】（第 2 批）；备注：尾批到货 40 件，验收合格，采购单完成；累计入库 100/100 件，库存账面同步增加，采购单已完成', date: d1, time: '10:40:00' },
+        { id: 'seed-log-po6', action: 'purchase-receive', actionLabel: '分批验收入库', orderId: 'seed-po1', operator: '仓配小李', detail: '分批验收入库【周年庆幸运转盘 / 定制保温杯×60】（第 1 批）；备注：首批到货 60 件，验收合格；累计入库 60/100 件，库存账面同步增加，剩余待入库可继续验收', date: d2, time: '15:20:00' }
+      )
+
+      // —— 12) 星河商贸种子数据统一补打租户/追踪标记（历史种子按默认租户 t-star 归属） ——
       const tagStar = (list, fields = {}) => list.forEach((x) => {
         if (x.tenantId === undefined) x.tenantId = 't-star'
         Object.assign(x, fields)
@@ -3624,6 +3987,7 @@ export const usePlatformStore = defineStore('platform', {
       tagStar(this.riskOrders)
       tagStar(this.shipments)
       tagStar(this.afterSales)
+      tagStar(this.purchaseOrders)
       tagStar(this.coupons)
       tagStar(this.couponLogs)
       tagStar(this.pointRecords)
@@ -3644,7 +4008,7 @@ export const usePlatformStore = defineStore('platform', {
         }
       })
 
-      // —— 12) 第二租户云雀数科种子：独立活动/商品/卡券/审核单/发货单，与星河商贸数据强隔离 ——
+      // —— 13) 第二租户云雀数科种子：独立活动/商品/卡券/审核单/发货单，与星河商贸数据强隔离 ——
       this.seedCloudTenant()
     },
 
@@ -3733,6 +4097,18 @@ export const usePlatformStore = defineStore('platform', {
         { id: 'seed-ccl2', action: 'hold', actionLabel: '风控预占', couponId: '', code: '', tplId: 'cc-svip', tplName: '云雀 SVIP 季卡', recordId: recC2.id, bizType: 'draw', orderId: 'seed-crk1', tenantId: tid, traceId: '', operator: uname, note: '风控冻结，券库存预占、待放行交付', date: this.todayDate, time: '11:05:50', ts: todayAt(11, 5) },
         { id: 'seed-ccl1', action: 'issue', actionLabel: '卡券发放', couponId: 'seed-ccp1', code: 'CPC-CL0UD-WELCM', tplId: 'cc-welcome', tplName: tplWelcome.name, recordId: recC1.id, bizType: 'redeem', orderId: '', tenantId: tid, traceId: '', operator: uname, note: '', date: this.todayDate, time: '10:12:30', ts: todayAt(10, 12) + 1 }
       )
+
+      // 5) 采购入库种子：马克杯补货待审批（与星河商贸采购单强隔离）
+      this.purchaseOrders.push({
+        id: 'seed-cpo1', tenantId: tid, traceId: '',
+        status: 'pending',
+        items: [{ targetType: 'goods', activityId: null, targetId: 'cg2', targetName: '云雀定制马克杯', icon: '☕', qty: 30, receivedQty: 0 }],
+        note: '马克杯库存告急，申请补货 30 件',
+        applicant: '运营小冯', applicantId: 'm-cloud-ops',
+        createdAt: this.todayDate, createdTime: '11:40:00', ts: todayAt(11, 40),
+        reviewedAt: '', reviewer: '', reviewNote: '',
+        batches: []
+      })
       const cloudAudit = (id, action, label, orderId, operator, detail, date, time, result = 'success', module = moduleOfAction(action)) => ({
         id, action, actionLabel: label, module, orderId, operator,
         actorKind: operator.startsWith('运营') ? 'staff' : operator === '系统' ? 'system' : 'customer',
@@ -3743,6 +4119,7 @@ export const usePlatformStore = defineStore('platform', {
         logTs: (() => { const hh = parseInt(time.slice(0, 2)); const mm = parseInt(time.slice(3, 5)); return todayAt(hh, mm) - (date === this.todayDate ? 0 : 86400000) })()
       })
       this.auditLogs.push(
+        cloudAudit('seed-clog5', 'purchase-create', '发起采购', 'seed-cpo1', '运营小冯', '云雀数科：发起采购【云雀定制马克杯×30】；说明：马克杯库存告急，申请补货 30 件，待采购审批', this.todayDate, '11:40:00'),
         cloudAudit('seed-clog4', 'freeze', '风控冻结', 'seed-crk1', uname, '云雀数科：抽奖【云雀 SVIP 季卡】命中规则：高价值奖品/兑换，预占库存×1；该笔暂缓计入抽奖任务进度', this.todayDate, '11:05:50'),
         cloudAudit('seed-clog3', 'ship-receive', '确认收货', 'seed-csp1', uname, '确认收货【云雀定制马克杯】（圆通速递 YT992100046），订单完成', this.todayDate, '10:20:00'),
         cloudAudit('seed-clog2', 'ship-send', '运营发货', 'seed-csp1', '运营小冯', '云雀数科：接单发货【云雀定制马克杯】：圆通速递 单号 YT992100046', d1, '17:10:00'),

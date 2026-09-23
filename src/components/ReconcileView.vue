@@ -179,9 +179,10 @@
             <span class="dr-ic">{{ st.icon || '📦' }}</span>
             <span class="dr-label">
               {{ st.name }}
-              <em class="muted">（初始 {{ st.stock }} − 有效消耗 {{ st.consumed }} + 已校正 {{ st.adjusted }}）</em>
+              <em class="muted">（期初 {{ st.stock - (st.inbound || 0) }}<template v-if="st.inbound"> + 采购入库 {{ st.inbound }}</template> − 有效消耗 {{ st.consumed }} + 已校正 {{ st.adjusted }}）</em>
               <em v-if="st.asReturned" class="muted"> · 售后退回已回补 {{ st.asReturned }}</em>
               <em v-if="st.asReshipped" class="muted"> · 售后补发已消耗 {{ st.asReshipped }}</em>
+              <em v-if="st.dayInbound" class="muted"> · 当日采购入库 +{{ st.dayInbound }}</em>
               <em v-if="st.dayConsumed" class="muted"> · 当日净变动 {{ st.dayConsumed > 0 ? '-' : '+' }}{{ Math.abs(st.dayConsumed) }}</em>
               <i v-if="st.frozenHeld" class="frozen-tag">🧊 预占 {{ st.frozenHeld }}</i>
             </span>
