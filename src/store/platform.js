@@ -1,0 +1,3772 @@
+import { defineStore } from 'pinia'
+import { ACTIVITIES, TASKS, SHOP_GOODS, DEMO_USER, DEFAULT_RISK_RULES, COUPONS, COUPON_TYPES } from '@/mock/data'
+import {
+  TENANTS, MEMBERS, PLATFORM_MEMBERS, ROLE_TEMPLATES, PLATFORM_ROLE,
+  PERMISSION_GROUPS, PERMISSION_LABELS, CUSTOMER, CLOUD_COUPONS
+} from '@/mock/tenant'
+import { CLOUD_ACTIVITIES, CLOUD_GOODS } from '@/mock/cloud-data'
+
+// 加权随机抽取（按权重选一个奖品下标）
+function drawByWeight(prizes) {
+  const total = prizes.reduce((s, p) => s + p.weight, 0)
+  let r = Math.random() * total
+  for (let i = 0; i < prizes.length; i++) {
+    r -= prizes[i].weight
+    if (r < 0) return i
+  }
+  return prizes.length - 1
+}
+
+// 生成某租户的独立默认风控规则（深拷贝，避免各租户共享数组/对象引用导致串配）
+function makeDefaultRiskRules() {
+  return {
+    ...DEFAULT_RISK_RULES,
+    highValueRarities: [...DEFAULT_RISK_RULES.highValueRarities],
+    blacklist: [...DEFAULT_RISK_RULES.blacklist]
+  }
+}
+
+function nowTime() {
+  return new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+function todayStr() {
+  // 业务日按本地自然日计算（与 nowTime 的本地时间保持一致，避免 UTC 偏移导致跨日错配）
+  return dateStr(0)
+}
+// 相对今天偏移 offset 天的业务日字符串（负数取历史日，用于跨日台账/种子数据）
+function dateStr(offsetDays = 0) {
+  const d = new Date()
+  d.setDate(d.getDate() + offsetDays)
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${m}-${day}`
+}
+// 今天某时刻（h:m）的时间戳，用于构造演示数据/风控窗口比较
+function todayAt(h, m = 0) {
+  const d = new Date()
+  d.setHours(h, m, 0, 0)
+  return d.getTime()
+}
+
+// 风控规则文案
+const RULE_LABELS = {
+  blacklist: '黑名单用户',
+  highValue: '高价值奖品/兑换',
+  dailyBurst: '当日抽奖频次超限',
+  rapidDraw: '短时间连续抽奖',
+  rapidRedeem: '短时间连续兑换'
+}
+export const RISK_RULE_LABELS = RULE_LABELS
+
+// 审核单状态文案与样式标记
+export const RISK_STATUS = {
+  pending: { label: '待审核', tone: 'warn' },
+  appealed: { label: '已申诉', tone: 'info' },
+  released: { label: '已放行', tone: 'ok' },
+  revoked: { label: '已撤销', tone: 'bad' }
+}
+
+// 发货单状态文案与样式标记
+// pending_address 待填地址 → to_ship 待发货（运营接单）→ shipped 已发货/待收货 → received 已收货
+// returned 已退回（售后拒收/退货审核通过后回写，终态）
+export const SHIP_STATUS = {
+  pending_address: { label: '待填地址', tone: 'warn' },
+  to_ship: { label: '待发货', tone: 'info' },
+  shipped: { label: '已发货', tone: 'ok' },
+  received: { label: '已收货', tone: 'muted' },
+  returned: { label: '已退回', tone: 'bad' }
+}
+
+// 售后类型文案与样式标记
+// reject 拒收退回（仅已发货未签收）｜ return 退货退款（仅已收货）｜ reship 补发（已发货/已收货，不退款）
+export const AFTERSALE_TYPES = {
+  reject: { label: '拒收退回', tone: 'bad', icon: '🚫' },
+  return: { label: '退货退款', tone: 'warn', icon: '↩️' },
+  reship: { label: '补发', tone: 'info', icon: '📦' }
+}
+
+// 售后单状态文案与样式标记
+// pending 待审核 → done 已完成（审核通过并回写库存/积分/发货单）｜ dismissed 已驳回（不动账）
+export const AFTERSALE_STATUS = {
+  pending: { label: '待审核', tone: 'warn' },
+  done: { label: '已完成', tone: 'ok' },
+  dismissed: { label: '已驳回', tone: 'muted' }
+}
+
+// 卡券账户实例状态文案与样式标记
+// available 待核销（发券即入账）→ redeemed 已核销（运营扫码核销）/ expired 已过期（到期扫描）
+// 风控冻结期不生成券账户实例（库存预占）：放行后发券交付，撤销则库存回补、券始终不发出
+export const COUPON_STATUS = {
+  available: { label: '待核销', tone: 'ok' },
+  redeemed: { label: '已核销', tone: 'muted' },
+  expired: { label: '已过期', tone: 'bad' }
+}
+
+// ===== 多租户与权限中心常量 =====
+export const MEMBER_STATUS = {
+  active: { label: '在职', tone: 'ok' },
+  disabled: { label: '已停用', tone: 'bad' }
+}
+
+// 操作归类的业务模块（全链路审计按模块检索/筛选）
+export const AUDIT_MODULES = {
+  auth: '登录与身份',
+  org: '组织与权限',
+  platform: '平台租户',
+  activity: '抽奖活动',
+  points: '积分中心',
+  risk: '风控申诉',
+  ship: '物流发货',
+  aftersale: '售后闭环',
+  coupon: '卡券核销',
+  recon: '积分库存对账',
+  system: '系统'
+}
+// action 前缀 → 模块兜底映射（显式传 module 优先）
+const ACTION_MODULE_PREFIX = [
+  ['login-', 'auth'], ['switch-', 'auth'], ['identity-', 'auth'],
+  ['member-', 'org'], ['role-', 'org'],
+  ['tenant-', 'platform'],
+  ['task-settle', 'points'],
+  ['freeze', 'risk'], ['release', 'risk'], ['revoke', 'risk'], ['appeal', 'risk'], ['config', 'risk'],
+  ['ship-', 'ship'],
+  ['aftersale-', 'aftersale'],
+  ['coupon-', 'coupon'],
+  ['recon-', 'recon'],
+  ['day-rollover', 'system']
+]
+function moduleOfAction(action, module) {
+  if (module) return module
+  const hit = ACTION_MODULE_PREFIX.find(([pre]) => action === pre.replace(/-$/, '') || action.startsWith(pre))
+  return hit ? hit[1] : (action === 'draw' ? 'activity' : action === 'redeem' ? 'points' : 'system')
+}
+
+let seq = 0
+const genId = (p) => `${p}-${Date.now()}-${seq++}`
+// 全链路追踪号：一次用户操作（含其级联的冻结/发券/发货/对账等）共享同一 traceId
+const genTraceId = () => `tr-${Date.now().toString(36)}-${(seq++).toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`
+// 当前操作的隐式追踪上下文（顶层 action  beginTrace 开启，结束后清除）
+let currentTrace = ''
+
+export const usePlatformStore = defineStore('platform', {
+  state: () => ({
+    user: { ...DEMO_USER },
+    role: 'user',               // user | operator：演示角色（用户申诉 / 运营审核）
+    points: 0,                  // 用户可用积分（冻结部分不计入）
+    activities: [],             // 深拷贝
+    tasks: [],                  // 深拷贝（含完成状态）
+    goods: [],                  // 商城商品（响应式库存 + 预占）
+    records: [],                // 抽奖 / 兑换业务记录（含 frozen/released/revoked 状态）
+    shipments: [],              // 实物发货单（append-only）：中奖/兑换实物且有效（正常/风控放行）后生成，走 填地址→发货→收货 流程
+    pointRecords: [],           // 积分流水（append-only，财务留痕不裁剪）
+    taskClaims: [],             // 任务领奖台账（append-only）：{ taskId, bizDate 归属业务日, grantDate 实际发放日, reward, flowId }，发奖与补偿的统一判重依据
+    riskOrders: [],             // 风控审核单
+    afterSales: [],             // 售后单（append-only）：拒收/退货/补发申请与审核回写留痕
+    auditLogs: [],              // 操作记录（审计日志）
+    reconBills: [],             // 积分库存对账差异单（按业务日，append-only 保留执行/复核/补偿痕迹）
+    stockAdjustments: [],       // 库存校正台账（append-only）：对账补偿对 remain 的修正凭证
+    coupons: [],                // 卡券账户实例（append-only）：{ status: available|redeemed|expired, code 唯一券码, recordId 业务记录 }
+    couponLogs: [],             // 卡券业务台账（append-only 核销/发券留痕）：issue/hold/deliver/release/redeem/expire/revoke/comp
+    // 风控规则按租户隔离（tenantId → 规则对象），各租户在 init/开通时由默认规则深拷贝初始化
+    riskRulesByTenant: {},
+    todayDate: todayStr(),
+    activeTab: 'home',
+    toast: null,
+    // ===== 多租户与权限中心 =====
+    tenants: [],                // 租户（组织）列表
+    members: [],                // 员工账号（含平台方账号 m-platform）
+    customRoles: [],            // 租户自定义角色（内置角色来自 ROLE_TEMPLATES）
+    identityKind: 'customer',   // customer | staff | platform：当前登录身份
+    activeTenantId: 't-star',   // 当前数据上下文租户（客户"逛店"切换 / 员工归属租户 / 平台方可任意切换）
+    currentMemberId: '',        // 员工身份下的成员 id
+    lastDenied: null            // 最近一次权限/越权拦截（供 UI 提示与测试断言）
+  }),
+
+  getters: {
+    // 当前数据上下文租户的风控规则（与业务数据同口径隔离：
+    // A 租户调整规则不得影响 B 租户的抽奖/兑换判定；新租户开通时取默认规则的独立副本）
+    riskRules(s) {
+      return s.riskRulesByTenant[s.activeTenantId] || s.riskRulesByTenant['t-star'] || makeDefaultRiskRules()
+    },
+    // 是否运营身份（员工 / 平台超管均视为运营视角；兼容旧 role 字段）
+    isOperator: (s) => s.role === 'operator',
+    // 当前数据上下文租户（未初始化时兜底 t-star）
+    activeTenant(s) {
+      return s.tenants.find((t) => t.id === s.activeTenantId) || s.tenants[0] || { id: 't-star', shortName: '星河商贸' }
+    },
+    // 冻结中的积分（抽奖成本 + 兑换成本；抽奖积分奖品在放行时才入账）——按当前租户隔离
+    frozenPoints(s) {
+      return s.riskOrders
+        .filter((o) => (o.tenantId || 't-star') === s.activeTenantId)
+        .filter((o) => o.status === 'pending' || o.status === 'appealed')
+        .reduce((sum, o) => sum + (o.frozenPoints || 0), 0)
+    },
+    // 每日抽奖次数（已撤销不计入：撤销后返还限次；待审核/已放行均占用次数）——按当前租户隔离
+    dailyDrawCount: (s) => (activityId) =>
+      s.records.filter(
+        (r) => r.type === 'draw' && r.activityId === activityId &&
+          r.date === s.todayDate && r.status !== 'revoked' &&
+          (r.tenantId || 't-star') === s.activeTenantId
+      ).length,
+    // 总抽奖次数统计——按当前租户隔离
+    totalDrawCount: (s) => (activityId) =>
+      s.records.filter(
+        (r) => r.type === 'draw' && r.activityId === activityId && r.status !== 'revoked' &&
+          (r.tenantId || 't-star') === s.activeTenantId
+      ).length,
+    // 有效业务记录（已撤销不计入业务与统计）
+    validRecords(s) {
+      return s.records.filter((r) => r.status !== 'revoked')
+    },
+    // 某业务日有效抽奖次数（真实参与记录：正常 + 审核放行计入；冻结暂缓、撤销回退均不计）——按租户
+    validDrawCount: (s) => (date, tenantId = s.activeTenantId) =>
+      s.records.filter(
+        (r) => r.type === 'draw' && r.date === date &&
+          (r.tenantId || 't-star') === tenantId &&
+          (r.status === 'normal' || r.status === 'released')
+      ).length,
+    // 某业务日风控审核中的抽奖笔数（暂缓计入任务进度，放行后补计、撤销后不计）——按租户
+    pendingDrawCount: (s) => (date, tenantId = s.activeTenantId) =>
+      s.records.filter(
+        (r) => r.type === 'draw' && r.date === date && r.status === 'frozen' &&
+          (r.tenantId || 't-star') === tenantId
+      ).length,
+    // 抽奖任务当日状态：进度/达标/已结算/审核中笔数（进度由真实记录推导，不落库）
+    drawTaskState(s) {
+      return (taskId) => {
+        const t = s.tasks.find((x) => x.id === taskId)
+        if (!t || t.metric !== 'draw') return null
+        const date = s.todayDate
+        const progress = this.validDrawCount(date)
+        const claim = s.taskClaims.find((c) => c.taskId === taskId && c.bizDate === date)
+        return {
+          goal: t.goal,
+          progress,
+          pending: this.pendingDrawCount(date),
+          done: progress >= t.goal,
+          claimed: !!claim,
+          claim: claim || null
+        }
+      }
+    },
+    // 任务台账：按业务日保留每个抽奖任务的进度与领奖记录（跨日审核各记各的账，不串日）
+    taskDayBooks(s) {
+      const drawTasks = s.tasks.filter((t) => t.metric === 'draw')
+      const dates = new Set()
+      s.records.forEach((r) => { if (r.type === 'draw') dates.add(r.date) })
+      s.taskClaims.forEach((c) => dates.add(c.bizDate))
+      return [...dates].sort().reverse().map((date) => ({
+        date,
+        isToday: date === s.todayDate,
+        tasks: drawTasks.map((t) => {
+          const claim = s.taskClaims.find((c) => c.taskId === t.id && c.bizDate === date)
+          return {
+            taskId: t.id,
+            label: t.label,
+            goal: t.goal,
+            reward: t.reward,
+            progress: this.validDrawCount(date),
+            pending: this.pendingDrawCount(date),
+            claim: claim || null
+          }
+        })
+      }))
+    },
+    // 待处理审核单数（用户端/运营端角标）——按当前租户隔离；客户只看本人单据
+    pendingRiskCount(s) {
+      const tid = s.activeTenantId
+      return s.riskOrders.filter((o) =>
+        (o.status === 'pending' || o.status === 'appealed') &&
+        (o.tenantId || 't-star') === tid &&
+        (s.role === 'operator' || o.userId === s.user.id)).length
+    },
+    // 运营看板统计（同步冻结/撤销状态）——按当前租户上下文隔离；平台超管可传 tenantId 查看指定租户
+    dashboard(state) {
+      return this.dashboardOf(state.activeTenantId)
+    },
+    dashboardOf(s) {
+      return (tenantId) => {
+        const tid = tenantId || s.activeTenantId
+        const inT = (x) => (x.tenantId || 't-star') === tid
+        const recordsT = s.records.filter(inT)
+        const flowsT = s.pointRecords.filter(inT)
+        const draws = recordsT.filter((r) => r.type === 'draw' && r.status !== 'revoked')
+        const acts = s.activities.filter((a) => a.tenantId === tid)
+        return {
+          totalDraws: draws.length,
+          running: acts.filter((a) => a.status === 'running').length,
+          participants: Math.round(draws.length * 1.7) + 128,
+          legendaryWins: draws.filter((r) => r.rarity === 'legendary').length,
+          epicWins: draws.filter((r) => r.rarity === 'epic').length,
+          pointsIssued: flowsT
+            .filter((p) => p.delta > 0 && p.kind !== 'refund')
+            .reduce((sum, p) => sum + p.delta, 0),
+          goodsSold: recordsT.filter((r) => r.type === 'redeem' && r.status !== 'revoked').length,
+          taskSettlements: s.taskClaims.filter((c) => (c.tenantId || 't-star') === tid && c.source === 'auto').length,
+          pendingRisk: s.riskOrders.filter((o) => inT(o) && (o.status === 'pending' || o.status === 'appealed')).length,
+          frozenPoints: s.riskOrders
+            .filter((o) => inT(o) && (o.status === 'pending' || o.status === 'appealed'))
+            .reduce((sum, o) => sum + (o.frozenPoints || 0), 0),
+          // 对账看板：对账业务日数、待复核差异单数、累计补偿积分、库存校正次数
+          reconDays: s.reconBills.filter((b) => (b.tenantId || 't-star') === tid).length,
+          reconOpen: s.reconBills.filter((b) => inT(b) && ['pending', 'reviewed'].includes(b.status)).length,
+          reconCompensated: flowsT
+            .filter((p) => p.kind === 'recon-comp' || p.kind === 'task-comp')
+            .reduce((sum, p) => sum + p.delta, 0),
+          stockAdjCount: s.stockAdjustments.filter((x) => (x.tenantId || 't-star') === tid).length,
+          // 实物发货看板：待填地址 / 待运营发货 / 已发货待收货 / 已完成 / 已退回
+          shipPendingAddress: s.shipments.filter((o) => inT(o) && o.status === 'pending_address').length,
+          shipToShip: s.shipments.filter((o) => inT(o) && o.status === 'to_ship').length,
+          shipShipped: s.shipments.filter((o) => inT(o) && o.status === 'shipped').length,
+          shipReceived: s.shipments.filter((o) => inT(o) && o.status === 'received').length,
+          shipReturned: s.shipments.filter((o) => inT(o) && o.status === 'returned').length,
+          // 售后看板：待审核 / 已完成 / 已驳回 / 补发新单量
+          afterSalePending: s.afterSales.filter((a) => inT(a) && a.status === 'pending').length,
+          afterSaleDone: s.afterSales.filter((a) => inT(a) && a.status === 'done').length,
+          afterSaleDismissed: s.afterSales.filter((a) => inT(a) && a.status === 'dismissed').length,
+          shipReshipped: s.shipments.filter((o) => inT(o) && o.source === '售后补发').length,
+          // 卡券看板：累计发券 / 待核销 / 已核销 / 已过期 / 风控预占待交付
+          couponIssued: s.coupons.filter(inT).length,
+          couponAvailable: s.coupons.filter((c) => inT(c) && c.status === 'available').length,
+          couponRedeemed: s.coupons.filter((c) => inT(c) && c.status === 'redeemed').length,
+          couponExpired: s.coupons.filter((c) => inT(c) && c.status === 'expired').length,
+          couponHeld: recordsT.filter((r) => r.status === 'frozen' && r.couponId).length
+        }
+      }
+    },
+    // 某业务日的对账差异单（一租户一业务日一单，重复执行更新同单并保留痕迹）
+    reconBillOf: (s) => (date, tenantId = s.activeTenantId) =>
+      s.reconBills.find((b) => b.date === date && (b.tenantId || 't-star') === tenantId) || null,
+    // 存在差异、尚未平账的对账单元数（看板/Tab 角标）——按当前租户
+    reconOpenCount(s) {
+      return s.reconBills.filter(
+        (b) => (b.tenantId || 't-star') === s.activeTenantId && ['pending', 'reviewed'].includes(b.status)
+      ).length
+    },
+    // 可选对账业务日（当前租户；兼容旧调用 reconDates / reconDates()）
+    reconDates(s) {
+      const list = (tenantId = s.activeTenantId) => {
+        const tid = tenantId
+        const dates = new Set()
+        s.records.forEach((r) => { if ((r.tenantId || 't-star') === tid) dates.add(r.date) })
+        s.riskOrders.forEach((o) => { if ((o.tenantId || 't-star') === tid) dates.add(o.createdAt) })
+        s.taskClaims.forEach((c) => {
+          if ((c.tenantId || 't-star') === tid) { dates.add(c.bizDate); dates.add(c.grantDate) }
+        })
+        s.reconBills.forEach((b) => { if ((b.tenantId || 't-star') === tid) dates.add(b.date) })
+        dates.add(s.todayDate)
+        return [...dates].sort().reverse()
+      }
+      // 同时支持属性访问（数组）与函数调用（指定租户）
+      return Object.assign(list(s.activeTenantId), { forTenant: list })
+    },
+    // 业务记录对应的实物发货单（一条有效实物业务记录至多一张发货单）
+    shipmentOfRecord: (s) => (recordId) => s.shipments.find((o) => o.recordId === recordId) || null,
+    // 当前数据上下文租户内的发货单（员工视角；客户改走 myShipments）
+    scopedShipments(s) {
+      return s.shipments.filter((o) => (o.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内售后单
+    scopedAfterSales(s) {
+      return s.afterSales.filter((a) => (a.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内风控审核单
+    scopedRiskOrders(s) {
+      return s.riskOrders.filter((o) => (o.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内卡券实例
+    scopedCoupons(s) {
+      return s.coupons.filter((c) => (c.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内业务记录
+    scopedRecords(s) {
+      return s.records.filter((r) => (r.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内积分流水
+    scopedPointRecords(s) {
+      return s.pointRecords.filter((p) => (p.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内卡券台账
+    scopedCouponLogs(s) {
+      return s.couponLogs.filter((l) => (l.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前租户内库存校正凭证
+    scopedStockAdjustments(s) {
+      return s.stockAdjustments.filter((x) => (x.tenantId || 't-star') === s.activeTenantId)
+    },
+    // 当前用户的发货单（最新在前）——按"逛店"租户隔离
+    myShipments(s) {
+      return [...s.shipments]
+        .filter((o) => o.userId === s.user.id && (o.tenantId || 't-star') === s.activeTenantId)
+        .sort((a, b) => b.ts - a.ts)
+    },
+    // 运营待接单发货数（地址已填、尚未发货）——运营 Tab 角标（按当前租户）
+    pendingShipCount(s) {
+      return s.shipments.filter(
+        (o) => (o.tenantId || 't-star') === s.activeTenantId && o.status === 'to_ship'
+      ).length
+    },
+    // 用户待办数（待填地址 + 已发货待确认收货）——用户 Tab 角标（按当前租户）
+    myShipTodoCount(s) {
+      return s.shipments.filter(
+        (o) => o.userId === s.user.id && (o.tenantId || 't-star') === s.activeTenantId &&
+          (o.status === 'pending_address' || o.status === 'shipped')
+      ).length
+    },
+    // 发货看板统计（按状态 + 总量）——按当前租户
+    shipmentStats(s) {
+      const list = s.shipments.filter((o) => (o.tenantId || 't-star') === s.activeTenantId)
+      return {
+        total: list.length,
+        pendingAddress: list.filter((o) => o.status === 'pending_address').length,
+        toShip: list.filter((o) => o.status === 'to_ship').length,
+        shipped: list.filter((o) => o.status === 'shipped').length,
+        received: list.filter((o) => o.status === 'received').length,
+        returned: list.filter((o) => o.status === 'returned').length
+      }
+    },
+    // ===== 售后（拒收/退货/补发） =====
+    // 发货单关联的售后单（最新一条在前；一单可有多条历史，如驳回后重新申请）
+    afterSalesOfShipment: (s) => (shipmentId) =>
+      s.afterSales.filter((a) => a.shipmentId === shipmentId)
+        .sort((a, b) => b.ts - a.ts),
+    // 当前用户的售后单（最新在前）
+    myAfterSales(s) {
+      return [...s.afterSales]
+        .filter((a) => a.userId === s.user.id)
+        .sort((a, b) => b.ts - a.ts)
+    },
+    // 运营待审核售后数 —— 运营 Tab 角标（按当前租户）
+    pendingAfterSaleCount(s) {
+      return s.afterSales.filter(
+        (a) => (a.tenantId || 't-star') === s.activeTenantId && a.status === 'pending'
+      ).length
+    },
+    // 用户售后待办角标：我的申请仍在审核中（按当前租户）
+    myAfterSalePendingCount(s) {
+      return s.afterSales.filter(
+        (a) => a.userId === s.user.id && (a.tenantId || 't-star') === s.activeTenantId && a.status === 'pending'
+      ).length
+    },
+    // ===== 卡券账户 =====
+    // 卡券模板（按 id 索引；含两个租户的全部模板）
+    couponTpls: () => [...COUPONS, ...CLOUD_COUPONS].reduce((m, c) => { m[c.id] = c; return m }, {}),
+    // 某奖品/商品是否为券类（券类在中奖/兑换有效后发券至卡券账户，不产生发货单）
+    couponOfTarget: (s) => (rec) => {
+      const id = rec.type === 'draw' ? rec.couponId : rec.couponId
+      if (!id) return null
+      return s.couponTpls[id] || null
+    },
+    // 业务记录对应的卡券实例（一条有效券业务记录至多一张券，与发货单同理）
+    couponOfRecord: (s) => (recordId) => s.coupons.find((c) => c.recordId === recordId) || null,
+    // 当前用户的卡券账户（最新在前）——按"逛店"租户隔离
+    myCoupons(s) {
+      return [...s.coupons]
+        .filter((c) => c.userId === s.user.id && (c.tenantId || 't-star') === s.activeTenantId)
+        .sort((a, b) => b.ts - a.ts)
+    },
+    // 风控冻结中、待放行交付的券（预占：库存已扣，券尚未发至账户）——按当前租户；
+    // 演示中冻结单均为消费者 u-1001 产生（员工登录后查看客户预占也走此口径）
+    myHeldCoupons(s) {
+      const customerId = CUSTOMER.id
+      return s.records
+        .filter((r) => r.status === 'frozen' && r.couponId &&
+          (r.tenantId || 't-star') === s.activeTenantId &&
+          (!r.userId || r.userId === customerId))
+        .sort((a, b) => b.ts - a.ts)
+    },
+    // 用户卡券待办角标：待核销（含今日即将到期的提示由组件推导）——按当前租户
+    myCouponTodoCount(s) {
+      return s.coupons.filter(
+        (c) => c.userId === s.user.id && (c.tenantId || 't-star') === s.activeTenantId && c.status === 'available'
+      ).length
+    },
+    // 运营待核销券数（当前租户全部用户待核销券）——运营 Tab 角标
+    pendingRedeemCount(s) {
+      return s.coupons.filter(
+        (c) => (c.tenantId || 't-star') === s.activeTenantId && c.status === 'available'
+      ).length
+    },
+    // 卡券看板统计——按当前租户
+    couponStats(s) {
+      const list = s.coupons.filter((c) => (c.tenantId || 't-star') === s.activeTenantId)
+      const now = Date.now()
+      const todayEnd = (() => { const d = new Date(); d.setHours(23, 59, 59, 999); return d.getTime() })()
+      return {
+        issued: list.length,
+        available: list.filter((c) => c.status === 'available').length,
+        redeemed: list.filter((c) => c.status === 'redeemed').length,
+        expired: list.filter((c) => c.status === 'expired').length,
+        held: s.records.filter(
+          (r) => (r.tenantId || 't-star') === s.activeTenantId && r.status === 'frozen' && r.couponId
+        ).length,
+        expiringToday: list.filter((c) => c.status === 'available' && c.expireTs <= todayEnd && c.expireTs >= now).length
+      }
+    },
+    // ===== 多租户与权限中心：身份 / 角色 / 权限 =====
+    isPlatform: (s) => s.identityKind === 'platform',
+    isCustomer: (s) => s.identityKind === 'customer',
+    // 当前登录成员（员工/平台方）
+    currentMember(s) {
+      return s.members.find((m) => m.id === s.currentMemberId) || null
+    },
+    // 全部角色（内置 + 各租户自定义，当前租户上下文可管理）
+    allRoles(s) {
+      return [PLATFORM_ROLE, ...ROLE_TEMPLATES, ...s.customRoles]
+    },
+    // 当前租户可选角色（平台超管角色不参与租户内分配）
+    tenantRoles(s) {
+      return (tid = s.activeTenantId) => [
+        ...ROLE_TEMPLATES,
+        ...s.customRoles.filter((r) => r.tenantId === tid)
+      ]
+    },
+    // 角色对象（内置/自定义/平台）
+    roleOfKey: (s) => (roleKey) =>
+      [PLATFORM_ROLE, ...ROLE_TEMPLATES, ...s.customRoles].find((r) => r.key === roleKey) || null,
+    // 成员→权限集合（org_admin / platform_admin 的 '*' 在 can 中解释）
+    permissionsOf(s) {
+      return (memberId) => {
+        const m = s.members.find((x) => x.id === memberId)
+        if (!m || m.status !== 'active') return new Set()
+        const role = [PLATFORM_ROLE, ...ROLE_TEMPLATES, ...s.customRoles].find((r) => r.key === m.roleKey)
+        if (!role) return new Set()
+        if (role.permissions === '*') return new Set(['*'])
+        return new Set(role.permissions || [])
+      }
+    },
+    // 当前身份是否拥有某权限（客户只有 null 权限集；平台超管 = 全部；组织管理员 = 除平台方外全部）
+    can(s) {
+      return (perm) => {
+        if (s.identityKind === 'platform') return true
+        if (s.identityKind !== 'staff') return false
+        const m = s.members.find((x) => x.id === s.currentMemberId)
+        if (!m || m.status !== 'active') return false
+        if (m.roleKey === 'org_admin') return perm !== 'tenant:manage'
+        const role = [...ROLE_TEMPLATES, ...s.customRoles].find((r) => r.key === m.roleKey)
+        if (!role) return false
+        if (role.permissions === '*') return perm !== 'tenant:manage'
+        return (role.permissions || []).includes(perm)
+      }
+    },
+    // 当前员工是否可管理指定租户数据（本租户员工或平台超管）
+    canAccessTenant(s) {
+      return (tenantId) => {
+        if (s.identityKind === 'platform') return true
+        if (s.identityKind !== 'staff') return false
+        const m = s.members.find((x) => x.id === s.currentMemberId)
+        return !!m && m.status === 'active' && m.tenantId === tenantId
+      }
+    },
+    // 某租户成员（不含平台方）
+    membersOfTenant: (s) => (tenantId) => s.members.filter((m) => m.tenantId === tenantId),
+    // 平台方成员
+    platformMembers(s) {
+      return s.members.filter((m) => !m.tenantId)
+    },
+    // 租户运营概览（供权限中心组织卡片）
+    tenantSummary: (s) => (tenantId) => {
+      const tid = tenantId
+      const inT = (x) => (x.tenantId || 't-star') === tid
+      return {
+        members: s.members.filter((m) => m.tenantId === tid).length,
+        activeMembers: s.members.filter((m) => m.tenantId === tid && m.status === 'active').length,
+        activities: s.activities.filter((a) => a.tenantId === tid).length,
+        riskPending: s.riskOrders.filter((o) => inT(o) && ['pending', 'appealed'].includes(o.status)).length,
+        shipments: s.shipments.filter(inT).length,
+        afterSalePending: s.afterSales.filter((a) => inT(a) && a.status === 'pending').length,
+        coupons: s.coupons.filter(inT).length,
+        reconOpen: s.reconBills.filter((b) => inT(b) && ['pending', 'reviewed'].includes(b.status)).length,
+        auditToday: s.auditLogs.filter((l) => inT(l) && l.date === s.todayDate).length
+      }
+    },
+    // 审计模块标签
+    auditModuleLabel: () => (key) => AUDIT_MODULES[key] || key,
+    // 全链路审计：按条件检索（filters: { tenantId, module, keyword, result, traceId }），最新在前
+    auditEntries(s) {
+      return (filters = {}) => {
+        const kw = (filters.keyword || '').trim().toLowerCase()
+        return s.auditLogs.filter((l) => {
+          if (filters.tenantId && (l.tenantId || 't-star') !== filters.tenantId) return false
+          if (filters.module && l.module !== filters.module) return false
+          if (filters.result && l.result !== filters.result) return false
+          if (filters.traceId && l.traceId !== filters.traceId) return false
+          if (filters.actor && !(l.operator || '').toLowerCase().includes(filters.actor.toLowerCase())) return false
+          if (kw) {
+            const blob = `${l.actionLabel} ${l.detail} ${l.orderId} ${l.operator} ${l.ip || ''} ${l.traceId || ''}`.toLowerCase()
+            if (!blob.includes(kw)) return false
+          }
+          return true
+        })
+      }
+    },
+    // 全链路追踪：同一 traceId 下的审计日志 + 卡券台账 + 积分流水（按时间正序还原链路）
+    traceTimeline(s) {
+      return (traceId) => {
+        if (!traceId) return []
+        const items = []
+        s.auditLogs.filter((l) => l.traceId === traceId).forEach((l) =>
+          items.push({ kind: 'audit', ts: l.logTs || 0, label: l.actionLabel, operator: l.operator,
+            tenantId: l.tenantId || 't-star', detail: l.detail, date: l.date, time: l.time, result: l.result || 'success' }))
+        s.couponLogs.filter((l) => l.traceId === traceId).forEach((l) =>
+          items.push({ kind: 'coupon', ts: l.ts || 0, label: l.actionLabel, operator: l.operator,
+            tenantId: l.tenantId || 't-star', detail: l.note ? `${l.tplName} ${l.code} ${l.note}` : `${l.tplName} ${l.code}`,
+            date: l.date, time: l.time, result: 'success' }))
+        s.pointRecords.filter((p) => p.traceId === traceId).forEach((p) =>
+          items.push({ kind: 'points', ts: p.ts || 0, label: '积分流水', operator: p.note,
+            tenantId: p.tenantId || 't-star', detail: `${p.note}（${p.delta > 0 ? '+' : ''}${p.delta}，余额 ${p.balance}）`,
+            date: p.date, time: p.time, result: 'success' }))
+        return items.sort((a, b) => a.ts - b.ts)
+      }
+    }
+  },
+
+  actions: {
+    init() {
+      // —— 多租户：平台方 + 入驻组织 + 成员账号 ——
+      this.tenants = TENANTS.map((t) => ({ ...t }))
+      this.members = [...PLATFORM_MEMBERS, ...MEMBERS].map((m) => ({ ...m }))
+      this.customRoles = [
+        {
+          id: 'cr-star-1', tenantId: 't-star', key: 'cr_star_marketing', name: '营销主管（自定义）',
+          icon: '🎯', builtin: false,
+          desc: '组织管理员在权限中心自建：活动运营 + 卡券核销（无风控/对账权限），演示自定义角色与最小权限',
+          permissions: ['activity:manage', 'points:view', 'coupon:redeem']
+        }
+      ]
+      // 身份上下文：默认消费者，数据上下文为其归属租户
+      this.identityKind = 'customer'
+      this.activeTenantId = CUSTOMER.homeTenantId
+      this.currentMemberId = ''
+      this.user = { id: CUSTOMER.id, name: CUSTOMER.name, avatar: CUSTOMER.avatar }
+
+      // 风控规则按租户隔离：每个入驻租户持有默认规则的独立副本
+      this.riskRulesByTenant = {}
+      TENANTS.forEach((t) => { this.riskRulesByTenant[t.id] = makeDefaultRiskRules() })
+
+      // —— 业务数据：星河商贸 t-star ——
+      this.activities = ACTIVITIES.map((a) => ({
+        ...a,
+        tenantId: 't-star',
+        prizes: a.prizes.map((p) => ({ ...p, frozen: 0 }))
+      }))
+      // —— 云雀数科 t-cloud ——
+      CLOUD_ACTIVITIES.forEach((a) => {
+        this.activities.push({
+          ...a,
+          tenantId: 't-cloud',
+          prizes: a.prizes.map((p) => ({ ...p, frozen: 0 }))
+        })
+      })
+      this.tasks = TASKS.map((t) => ({
+        ...t,
+        done: false,
+        claimed: false
+      }))
+      this.goods = [
+        ...SHOP_GOODS.map((g) => ({ ...g, frozen: 0, tenantId: 't-star' })),
+        ...CLOUD_GOODS.map((g) => ({ ...g, frozen: 0, tenantId: 't-cloud' }))
+      ]
+      // 以当前真实业务日为种子数据的日期基准（避免种子单据的日期落在"昨天"）
+      this.todayDate = todayStr()
+      this.seedRiskData()
+    },
+
+    // ===== 统一业务日切换 =====
+    // 所有按日重置/统计的唯一入口：业务动作前、定时器轮询、页面重新可见时调用。
+    // 跨日处理：
+    //  - 重置每日任务（done/claimed 复位，可重新完成领取）；一次性任务保持已完成状态
+    //  - 刷新 todayDate：每日限抽、风控当日频次从新日期起算
+    //  - 保留累计抽奖次数、积分余额/流水，以及审核中（pending/appealed）单据的冻结积分与预占库存，支持跨日审核
+    syncBusinessDay(showHint = false) {
+      // 先做卡券到期扫描（每个业务动作都经过本入口，保证出示/核销前已过期券状态已流转）
+      this.sweepCouponExpiry(true)
+      const current = todayStr()
+      if (current === this.todayDate) return false
+      const prev = this.todayDate
+      // 归档前兜底结算上一业务日的抽奖任务（幂等）：已达标的防漏发，审核中的留待放行后补计
+      this.settleDrawTasks(prev)
+      this.todayDate = current
+
+      // 每日任务随业务日重置（保留一次性任务的进度与领取状态；
+      // 抽奖类任务进度由真实参与记录按日推导，领奖记录留存在 taskClaims 台账，无需重置）
+      this.tasks.forEach((t) => {
+        if (t.type === 'daily' && !t.metric) {
+          t.done = false
+          t.claimed = false
+        }
+      })
+
+      // 冻结权益不随跨日处置：待审核/已申诉单据仍占用冻结积分与预占库存，
+      // 运营可在新业务日继续放行/撤销；累计次数、历史流水/记录同样保留。
+      this.addAuditLog('day-rollover', null,
+        `业务日由 ${prev} 切换为 ${current}：每日任务与每日限次已重置，任务进度与领奖记录按业务日归档保留，审核中冻结权益保留`)
+      if (showHint) {
+        this.showToast(`🌅 已跨日至 ${current}，每日任务与抽奖次数已刷新，审核中的冻结权益保留`, 'info')
+      }
+      return true
+    },
+
+    showToast(msg, type = 'info') {
+      this.toast = { msg, type, id: Date.now() }
+    },
+    clearToast() {
+      this.toast = null
+    },
+
+    gotoTab(tab) {
+      this.activeTab = tab
+    },
+
+    // ===== 角色切换（演示权限，兼容旧入口） =====
+    // 'operator' 切换为当前租户的组织管理员；'user' 切回消费者。
+    // 页内各模块原有"用户/运营"视角按钮无需改造即可驱动 RBAC 身份体系。
+    setRole(role) {
+      if (role === 'operator') {
+        const member = this.members.find((m) => m.tenantId === this.activeTenantId && m.roleKey === 'org_admin' && m.status === 'active')
+          || this.members.find((m) => m.tenantId === this.activeTenantId && m.status === 'active')
+        if (member) {
+          this.loginAsMember(member.id, { legacy: true, silent: true })
+          this.addAuditLog('switch-role', null, `切换为运营视角（${this.activeTenant.shortName} · ${member.name}）`, { module: 'auth' })
+          this.showToast(`已切换为${this.activeTenant.shortName} · ${member.name}（${this.roleLabelOf(member.roleKey)}）`, 'info')
+          return
+        }
+      }
+      this.loginAsCustomer({ silent: true })
+      this.addAuditLog('switch-role', null, '切换为用户视角', { module: 'auth' })
+      this.showToast('已切换为普通用户视角', 'info')
+    },
+
+    // ===== 多租户身份与权限 =====
+    // 当前操作者展示名（审计留痕用）
+    actorName() {
+      if (this.identityKind === 'platform') return `平台方(${this.user.name})`
+      if (this.identityKind === 'staff') {
+        const m = this.currentMember
+        const t = this.tenants.find((x) => x.id === m?.tenantId)
+        return `${t?.shortName || '租户'}·${this.user.name}`
+      }
+      return this.user.name
+    },
+    roleLabelOf(roleKey) {
+      return this.roleOfKey(roleKey)?.name || roleKey
+    },
+    // 员工登录（成员选择 / 模拟登录）：停用账号被拒绝并写拒绝审计；登录成功才切换身份
+    loginAsMember(memberId, opts = {}) {
+      const m = this.members.find((x) => x.id === memberId)
+      if (!m) {
+        this.deny('login-denied', '成员不存在，登录被拒绝', { module: 'auth' })
+        return false
+      }
+      if (m.status !== 'active') {
+        // 不切换身份上下文：保持当前身份，仅记录拒绝事件
+        this.deny('login-denied',
+          `停用账号【${m.name}】尝试登录被拒绝（${m.disabledReason || '账号已停用'}）`,
+          { module: 'auth', tenantId: m.tenantId || '' })
+        return false
+      }
+      const trace = this.beginTrace()
+      this.identityKind = m.tenantId ? 'staff' : 'platform'
+      this.currentMemberId = m.id
+      if (m.tenantId) this.activeTenantId = m.tenantId
+      this.user = { id: m.id, name: m.name, avatar: m.avatar }
+      this.role = 'operator'
+      m.lastLoginAt = `${this.todayDate} ${nowTime()}`
+      if (!opts.silent) {
+        this.addAuditLog('login-member', m.id,
+          `员工登录：${m.name}（${this.roleLabelOf(m.roleKey)}）进入${m.tenantId ? this.activeTenant.shortName + '数据上下文' : '平台方跨租户视图'}，IP ${m.ip}`,
+          { module: 'auth', tenantId: m.tenantId || '', traceId: trace })
+        this.showToast(`已登录：${m.name} · ${this.roleLabelOf(m.roleKey)}`, 'success')
+      }
+      return true
+    },
+    // 切回消费者
+    loginAsCustomer(opts = {}) {
+      this.identityKind = 'customer'
+      this.currentMemberId = ''
+      this.role = 'user'
+      this.user = { id: CUSTOMER.id, name: CUSTOMER.name, avatar: CUSTOMER.avatar }
+      if (CUSTOMER.homeTenantId) this.activeTenantId = CUSTOMER.homeTenantId
+      if (!opts.silent) {
+        this.addAuditLog('login-customer', null, `切换为消费者身份（${CUSTOMER.name}），数据上下文：${this.activeTenant.shortName}`, { module: 'auth' })
+        this.showToast(`已切换为消费者：${CUSTOMER.name}`, 'info')
+      }
+      return true
+    },
+    // 切换数据上下文租户：消费者可"逛店"切换；员工仅可在本租户内（越权拒绝留痕）；平台方任意切换
+    switchTenant(tenantId) {
+      const t = this.tenants.find((x) => x.id === tenantId)
+      if (!t || t.status !== 'active') {
+        this.deny('tenant-denied', `租户不可用（${t?.name || tenantId}），切换被拒绝`, { module: 'auth' })
+        return false
+      }
+      if (this.identityKind === 'staff') {
+        const m = this.currentMember
+        if (m?.tenantId !== tenantId) {
+          this.deny('cross-tenant-denied',
+            `员工【${m?.name}】尝试切换至非归属租户【${t.name}】被拒绝（数据强隔离：仅可访问 ${this.activeTenant.shortName}）`,
+            { module: 'auth' })
+          return false
+        }
+      }
+      if (tenantId === this.activeTenantId) return true
+      const trace = this.beginTrace()
+      const from = this.activeTenantId
+      this.activeTenantId = tenantId
+      this.addAuditLog('switch-tenant', null,
+        `${this.identityKind === 'platform' ? '平台方' : this.identityKind === 'staff' ? '员工' : '消费者'}切换数据上下文：${this.tenants.find((x) => x.id === from)?.shortName || from} → ${t.shortName}`,
+        { module: 'auth', tenantId, traceId: trace })
+      this.showToast(`已切换到 ${t.icon} ${t.shortName} 的数据视图`, 'info')
+      return true
+    },
+    // 开启一次操作链路（返回 traceId；嵌套调用复用外层链路）
+    beginTrace() {
+      if (currentTrace) return currentTrace
+      currentTrace = genTraceId()
+      return currentTrace
+    },
+    endTrace() { currentTrace = '' },
+    // 权限/越权统一拒绝：toast + 写 result=denied 审计（不改变任何业务数据）
+    deny(action, detail, extra = {}) {
+      this.lastDenied = { at: Date.now(), action, detail, perm: extra.perm || '', tenantId: extra.tenantId || this.activeTenantId }
+      this.addAuditLog(action, extra.orderId || '', `⛔ ${detail}`, {
+        module: extra.module || 'system',
+        tenantId: extra.tenantId !== undefined ? extra.tenantId : this.activeTenantId,
+        result: 'denied',
+        traceId: extra.traceId
+      })
+      this.showToast(detail.replace(/^⛔\s*/, '⛔ '), 'warn')
+      return false
+    },
+    // 权限校验（员工/平台按 RBAC；客户始终拒绝运营类权限）。失败自动写拒绝审计。
+    requirePerm(perm, module = 'system', label = '') {
+      if (this.can(perm)) return true
+      const need = PERMISSION_LABELS[perm] || perm
+      const who = this.identityKind === 'customer' ? '消费者身份' : `当前角色【${this.roleLabelOf(this.currentMember?.roleKey || '')}】`
+      return this.deny('perm-denied', `${who}无「${label || need}」权限，操作已被拦截`, { module, perm })
+    },
+    // 租户归属校验（员工只能操作本租户数据；平台方放行）
+    requireSameTenant(tenantId, module = 'system') {
+      if (this.identityKind === 'platform') return true
+      if (this.identityKind !== 'staff') return true // 客户的数据归属由各业务自身的 userId 校验负责
+      const m = this.currentMember
+      if (m && m.tenantId === (tenantId || this.activeTenantId)) return true
+      return this.deny('cross-tenant-denied',
+        `越权访问其他租户数据被拦截（${m?.name || '员工'} 归属 ${this.activeTenant.shortName}）`, { module })
+    },
+
+    // ===== 积分流水（append-only，禁止改写历史行） =====
+    // extra（可选）：
+    //   bizDate 该笔归属业务日（跨日补偿/补计用；默认取实际发生业务日 todayDate）
+    //   refId   关联业务凭证（任务台账/对账差异单 id），用于逐笔勾稽与幂等判重
+    //   refType 关联类型：task-claim | recon-bill
+    addPointRecord(delta, note, kind = 'normal', extra = {}) {
+      // 常规流水取当前时刻；对历史业务日补账的流水（任务结算/对账补偿/放行发奖）显式续在现有链末端 +1ms，
+      // 保证其"期末余额"快照在按 ts 重放时落在链尾、余额链连续
+      const appendFlow = extra.bizDate && extra.bizDate !== (extra.date || this.todayDate)
+      const isChainTail = kind === 'recon-comp' || kind === 'task-comp' ||
+        (appendFlow && (kind === 'reward' || kind === 'release'))
+      // 时间戳严格单调递增：即使同一毫秒内连续多笔（脚本批量/连续点击），按 ts 重放顺序也与入账顺序一致，
+      // 避免相同时间戳排序不稳定导致余额快照链错位
+      const latestTs = this.pointRecords.reduce((mx, p) => Math.max(mx, p.ts || 0), 0)
+      const chainTs = isChainTail ? latestTs + 1 : Math.max(Date.now(), latestTs + 1)
+      const rec = {
+        id: genId('pr'),
+        date: extra.date || this.todayDate,
+        bizDate: extra.bizDate || extra.date || this.todayDate,
+        tenantId: extra.tenantId || this.activeTenantId,
+        traceId: extra.traceId || (extra.silent ? '' : currentTrace) || '',
+        time: extra.time || nowTime(),
+        // 即使调用方显式指定 ts（种子/压测脚本），也强制严格晚于现有链尾：
+        // 历史时间戳落在当前挂钟"未来"（种子按今天固定时刻构造）时，后记账不能排到链首，否则余额快照链断裂
+        ts: extra.ts ? Math.max(extra.ts, latestTs + 1) : chainTs,
+        delta,
+        // 余额快照：调用方先改 this.points 再记账，快照即记账后余额
+        balance: extra.balance !== undefined ? extra.balance : this.points,
+        note,
+        kind, // normal | frozen | release | refund | reward | task-comp | recon-comp
+        refId: extra.refId || '',
+        refType: extra.refType || ''
+      }
+      this.pointRecords.unshift(rec)
+      // 流水是余额链、历史对账和奖励统计的共同底账，即使超过演示列表长度也只能归档，不能删除；
+      // 删除任意历史行会让业务日净额和余额快照失去勾稽，进而误判缺笔并重复补偿。
+      return rec
+    },
+
+    // ===== 操作记录（全链路审计日志，append-only） =====
+    // extra：module 业务模块 | tenantId 归属租户 | result success|denied | traceId 链路追踪号 | silent 不继承当前链路
+    addAuditLog(action, orderId, detail, extra = {}) {
+      const member = this.identityKind === 'staff' || this.identityKind === 'platform' ? this.currentMember : null
+      const log = {
+        id: genId('log'),
+        action,
+        actionLabel: {
+          freeze: '风控冻结',
+          release: '审核放行',
+          revoke: '审核撤销',
+          appeal: '用户申诉',
+          config: '规则变更',
+          'task-settle': '任务结算',
+          'switch-role': '视角切换',
+          'switch-tenant': '租户切换',
+          'login-member': '员工登录',
+          'login-customer': '消费者切换',
+          'login-denied': '登录被拒绝',
+          'perm-denied': '权限拦截',
+          'cross-tenant-denied': '越权拦截',
+          'tenant-denied': '租户不可用',
+          'member-create': '新增成员',
+          'member-update': '成员变更',
+          'member-toggle': '成员停用/启用',
+          'member-role': '成员调岗',
+          'role-create': '新建角色',
+          'role-update': '角色权限变更',
+          'role-delete': '删除角色',
+          'tenant-create': '开通租户',
+          'tenant-toggle': '租户停用/启用',
+          'tenant-update': '租户配置变更',
+          draw: '参与抽奖',
+          redeem: '积分兑换',
+          'day-rollover': '业务日切换',
+          'recon-run': '对账执行',
+          'recon-review': '对账复核',
+          'recon-comp': '对账补偿',
+          'recon-inject': '差异注入',
+          'ship-create': '生成发货单',
+          'ship-address': '填写收货信息',
+          'ship-send': '运营发货',
+          'ship-receive': '确认收货',
+          'ship-trace': '物流轨迹同步',
+          'aftersale-apply': '售后申请',
+          'aftersale-approve': '售后审核通过',
+          'aftersale-dismiss': '售后驳回',
+          'coupon-issue': '卡券发放',
+          'coupon-hold': '卡券预占',
+          'coupon-deliver': '放行发券',
+          'coupon-release': '预占释放',
+          'coupon-redeem': '卡券核销',
+          'coupon-expire': '卡券到期',
+          'coupon-comp': '卡券补券'
+        }[action] || action,
+        module: moduleOfAction(action, extra.module),
+        orderId: orderId || '',
+        operator: extra.operator || this.actorName(),
+        actorKind: this.identityKind,                 // customer | staff | platform
+        memberId: member?.id || '',
+        tenantId: extra.tenantId !== undefined ? (extra.tenantId || '') : this.activeTenantId,
+        traceId: extra.traceId || (extra.silent ? '' : currentTrace) || '',
+        channel: extra.channel || (member ? '运营后台' : '移动端 H5'),
+        ip: extra.ip || member?.ip || '112.65.*.*',
+        result: extra.result || 'success',
+        detail,
+        date: this.todayDate,
+        time: nowTime(),
+        logTs: Date.now()
+      }
+      this.auditLogs.unshift(log)
+      // 审计日志为全链路留痕底账，放大容量且只淘汰最旧条目
+      if (this.auditLogs.length > 500) this.auditLogs.pop()
+      return log
+    },
+
+    // ===== 风控规则评估 =====
+    // 取指定租户的风控规则（缺失时补一份默认副本，保证规则配置天然按租户隔离）
+    ensureRiskRules(tenantId = this.activeTenantId) {
+      if (!this.riskRulesByTenant[tenantId]) {
+        this.riskRulesByTenant[tenantId] = makeDefaultRiskRules()
+      }
+      return this.riskRulesByTenant[tenantId]
+    },
+    // 抽奖：返回命中的规则 code 列表
+    evalDrawRisk(activity, prize) {
+      const hit = []
+      const r = this.ensureRiskRules(activity?.tenantId || this.activeTenantId)
+      if (!r.enabled) return hit
+      if (r.blacklist.includes(this.user.id)) hit.push('blacklist')
+      if (r.highValueRarities.includes(prize.rarity)) hit.push('highValue')
+      // 当日频次：含本次将达到阈值
+      const todayCount = this.dailyDrawCount(activity.id)
+      if (r.dailyDrawThreshold > 0 && todayCount + 1 >= r.dailyDrawThreshold) hit.push('dailyBurst')
+      // 短时连抽
+      if (r.rapidDrawSeconds > 0 && r.rapidDrawMax > 0) {
+        const since = Date.now() - r.rapidDrawSeconds * 1000
+        const recent = this.records.filter(
+          (x) => x.type === 'draw' && x.status !== 'revoked' && x.ts && x.ts >= since &&
+            (x.tenantId || 't-star') === this.activeTenantId
+        ).length
+        if (recent + 1 >= r.rapidDrawMax) hit.push('rapidDraw')
+      }
+      return hit
+    },
+    // 兑换：返回命中的规则 code 列表
+    evalRedeemRisk(goods) {
+      const hit = []
+      const r = this.ensureRiskRules((goods && goods.tenantId) || this.activeTenantId)
+      if (!r.enabled) return hit
+      if (r.blacklist.includes(this.user.id)) hit.push('blacklist')
+      if (goods.cost >= r.highValueRedeemCost) hit.push('highValue')
+      if (r.rapidRedeemSeconds > 0 && r.rapidRedeemMax > 0) {
+        const since = Date.now() - r.rapidRedeemSeconds * 1000
+        const recent = this.records.filter(
+          (x) => x.type === 'redeem' && x.status !== 'revoked' && x.ts && x.ts >= since &&
+            (x.tenantId || 't-star') === this.activeTenantId
+        ).length
+        if (recent + 1 >= r.rapidRedeemMax) hit.push('rapidRedeem')
+      }
+      return hit
+    },
+
+    // ===== 抽奖任务自动结算 =====
+    // 进度唯一来源：真实参与记录（validDrawCount）。冻结暂缓计入、放行补计、撤销不计。
+    // 幂等：同一（任务, 归属业务日）仅发奖一次——taskClaims 判重，重复调用/跨日补审不会重复发奖。
+    // 跨日：按参与记录的业务日（bizDate）归属结算，实际发放日 grantDate 单独记录，积分流水同步标注。
+    settleDrawTasks(bizDate, tenantId = this.activeTenantId) {
+      const date = bizDate || this.todayDate
+      const tid = tenantId
+      const drawTasks = this.tasks.filter((t) => t.metric === 'draw' && t.type === 'daily')
+      if (!drawTasks.length) return []
+      const valid = this.validDrawCount(date, tid)
+      const settled = []
+      drawTasks.forEach((t) => {
+        if (valid < t.goal) return
+        if (this.taskClaims.some((c) => c.taskId === t.id && c.bizDate === date && (c.tenantId || 't-star') === tid)) return // 已结算，防重
+        const crossDay = date !== this.todayDate
+        const claimId = genId('tc')
+        this.points += t.reward
+        const flow = this.addPointRecord(
+          t.reward,
+          `任务结算：${t.label}${crossDay ? `（${date} 业务日补计）` : ''}`,
+          'reward',
+          { bizDate: date, refId: claimId, refType: 'task-claim', tenantId: tid }
+        )
+        this.taskClaims.push({
+          id: claimId,
+          taskId: t.id,
+          taskLabel: t.label,
+          reward: t.reward,
+          tenantId: tid,
+          bizDate: date,               // 任务归属业务日（按真实参与记录日期）
+          grantDate: this.todayDate,   // 实际发放业务日（跨日审核补计时晚于归属日）
+          time: nowTime(),
+          ts: Date.now(),
+          source: 'auto',
+          flowId: flow.id
+        })
+        this.addAuditLog('task-settle', null,
+          `【${this.tenants.find((x) => x.id === tid)?.shortName || tid}】抽奖任务【${t.label}】达成（${date} 有效参与 ${valid}/${t.goal}），自动发放 ${t.reward} 积分${crossDay ? '（跨日审核补计）' : ''}`,
+          { module: 'points', tenantId: tid })
+        settled.push(t)
+      })
+      if (settled.length) {
+        this.showToast(
+          `🎯 任务达成【${settled.map((t) => t.label).join('、')}】，+${settled.reduce((s, t) => s + t.reward, 0)} 积分已自动结算`,
+          'success')
+      }
+      return settled
+    },
+
+    // ===== 抽奖 =====
+    draw(activityId) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const act = this.activities.find((a) => a.id === activityId)
+      if (!act || act.status !== 'running' || act.tenantId !== this.activeTenantId) {
+        this.showToast('活动未在运行', 'warn')
+        this.endTrace()
+        return null
+      }
+      // 每日限抽
+      if (this.dailyDrawCount(activityId) >= act.dailyLimit) {
+        this.showToast(`今日已达抽奖上限（${act.dailyLimit} 次）`, 'warn')
+        this.endTrace()
+        return null
+      }
+      // 总限抽
+      if (this.totalDrawCount(activityId) >= act.totalLimit) {
+        this.showToast(`累计已达抽奖上限（${act.totalLimit} 次）`, 'warn')
+        this.endTrace()
+        return null
+      }
+      // 可抽取奖品（排除库存为 0 的实物，但"谢谢参与"始终保留）
+      const drawable = act.prizes.filter((p) => p.remain > 0 || p.rarity === 'none')
+      if (!drawable.length) {
+        this.showToast('奖品已抽完', 'warn')
+        this.endTrace()
+        return null
+      }
+      const idx = drawByWeight(drawable)
+      const prize = drawable[idx]
+      // 积分成本校验（先校验后扣减，避免无奖品时误扣）
+      const cost = act.costType === 'points' ? act.cost : 0
+      if (cost > 0 && this.points < cost) {
+        this.showToast('积分不足，无法参与', 'warn')
+        this.endTrace()
+        return null
+      }
+
+      // 风控评估（在任何扣减发生之前，杜绝部分扣减）
+      const riskHits = this.evalDrawRisk(act, prize)
+      if (riskHits.length) {
+        const frozen = this.freezeDraw(act, prize, cost, riskHits)
+        this.endTrace()
+        return frozen
+      }
+
+      // 正常放行
+      if (cost > 0) {
+        this.points -= cost
+        this.addPointRecord(-cost, `参与活动【${act.name}】`, 'normal', { tenantId: act.tenantId, traceId: trace })
+      }
+      this.saveDayLog()
+      if (prize.rarity !== 'none') {
+        const orig = act.prizes.find((p) => p.id === prize.id)
+        orig.remain -= 1
+      }
+      let pointDelta = 0
+      if (prize.name.includes('积分')) {
+        pointDelta = parseInt(prize.name) || 0
+        this.points += pointDelta
+      }
+
+      const rec = {
+        id: genId('r'),
+        type: 'draw',
+        status: 'normal',          // normal | frozen | released | revoked
+        tenantId: act.tenantId,
+        userId: this.user.id,
+        userName: this.user.name,
+        traceId: trace,
+        date: this.todayDate,
+        time: nowTime(),
+        ts: Date.now(),
+        activityId: act.id,
+        activityName: act.name,
+        prizeId: prize.id,
+        prizeName: prize.name,
+        rarity: prize.rarity,
+        couponId: prize.couponId || '',
+        icon: prize.emoji
+      }
+      this.records.unshift(rec)
+      if (pointDelta) this.addPointRecord(pointDelta, `抽奖获得：${prize.name}`, 'reward', { tenantId: act.tenantId, traceId: trace })
+      this.addAuditLog('draw', rec.id,
+        `参与抽奖【${act.name}】抽中【${prize.name}】${cost ? `，消耗 ${cost} 积分` : '（免费）'}`,
+        { module: 'activity', tenantId: act.tenantId, traceId: trace })
+      // 券类奖品：发券至卡券账户（唯一券码，用户出示、运营核销）；实物奖品生成发货单
+      const coupon = this.issueCouponForRecord(rec)
+      // 实物奖品：生成发货单，引导用户填写收货信息（积分奖品/券/谢谢参与不涉及物流）
+      const ship = this.createShipment(rec)
+      if (coupon) this.showToast(`🎟️ 获得卡券【${coupon.name}】，券码已发至「卡券核销」，有效期至 ${coupon.expireDate}`, 'success')
+      else if (ship) this.showToast(`🎉 获得实物：${prize.name}，请前往「物流发货」填写收货信息`, 'success')
+      else if (prize.rarity === 'legendary') this.showToast(`🎉 传说大奖！${prize.name}`, 'success')
+      else this.showToast(`获得：${prize.name}`, 'success')
+      // 真实参与记录落账后，按归属业务日自动结算抽奖任务（达标即发奖，幂等防重）
+      this.settleDrawTasks(rec.date, rec.tenantId)
+      this.endTrace()
+      return rec
+    },
+
+    // 冻结抽奖：占用成本积分 + 预占奖品库存，建立审核单
+    freezeDraw(act, prize, cost, riskHits) {
+      const trace = currentTrace || this.beginTrace()
+      if (cost > 0) {
+        this.points -= cost
+        this.addPointRecord(-cost, `冻结：参与【${act.name}】待风控审核`, 'frozen', { tenantId: act.tenantId, traceId: trace })
+      }
+      if (prize.rarity !== 'none') {
+        const orig = act.prizes.find((p) => p.id === prize.id)
+        orig.remain -= 1
+        orig.frozen += 1
+      }
+      const rec = {
+        id: genId('r'),
+        type: 'draw',
+        status: 'frozen',
+        tenantId: act.tenantId,
+        userId: this.user.id,
+        userName: this.user.name,
+        traceId: trace,
+        date: this.todayDate,
+        time: nowTime(),
+        ts: Date.now(),
+        activityId: act.id,
+        activityName: act.name,
+        prizeId: prize.id,
+        prizeName: prize.name,
+        rarity: prize.rarity,
+        couponId: prize.couponId || '',
+        icon: prize.emoji
+      }
+      this.records.unshift(rec)
+      const order = this.createRiskOrder({
+        bizType: 'draw',
+        recordId: rec.id,
+        activityId: act.id,
+        targetId: prize.id,
+        targetName: prize.name,
+        icon: prize.emoji,
+        rarity: prize.rarity,
+        cost,
+        stockHeld: prize.rarity === 'none' ? 0 : 1,
+        riskHits,
+        tenantId: act.tenantId
+      })
+      rec.riskOrderId = order.id
+      if (prize.couponId) this.addCouponLog('hold', null, rec, { orderId: order.id, traceId: trace })
+      this.showToast('⚠️ 该次抽奖触发风控，奖品与积分已冻结，审核通过前不计入抽奖任务进度；可在「风控申诉」中查看/申诉', 'warn')
+      return rec
+    },
+
+    // ===== 任务 =====
+    completeTask(taskId) {
+      this.syncBusinessDay()
+      const t = this.tasks.find((x) => x.id === taskId)
+      if (!t || t.claimed) return
+      // 抽奖类任务由真实参与记录驱动，自动结算，禁止手动领取（防刷/防重复发奖）
+      if (t.metric === 'draw') {
+        this.showToast('抽奖任务按真实参与记录自动结算，达标后自动发奖', 'info')
+        return
+      }
+      t.done = true
+      this.claimTask(taskId)
+    },
+    claimTask(taskId) {
+      this.syncBusinessDay()
+      const t = this.tasks.find((x) => x.id === taskId)
+      if (!t || t.claimed || !t.done) return
+      if (t.metric === 'draw') return // 抽奖任务奖励仅由 settleDrawTasks 发放
+      t.claimed = true
+      this.points += t.reward
+      this.addPointRecord(t.reward, `完成任务：${t.label}`, 'reward')
+      this.showToast(`获得 ${t.reward} 积分`, 'success')
+    },
+    // 一键签到
+    checkInTask() {
+      this.completeTask('t-checkin')
+    },
+
+    // ===== 商城兑换 =====
+    redeem(goodsId) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const g = this.goods.find((x) => x.id === goodsId)
+      if (!g || (g.tenantId || 't-star') !== this.activeTenantId) {
+        this.showToast('商品不存在或不属于当前租户', 'warn')
+        this.endTrace()
+        return null
+      }
+      if (g.remain <= 0) {
+        this.showToast('商品已兑完', 'warn')
+        this.endTrace()
+        return null
+      }
+      if (this.points < g.cost) {
+        this.showToast('积分不足', 'warn')
+        this.endTrace()
+        return null
+      }
+
+      // 风控评估（扣减前）
+      const riskHits = this.evalRedeemRisk(g)
+      if (riskHits.length) {
+        const frozen = this.freezeRedeem(g, riskHits)
+        this.endTrace()
+        return frozen
+      }
+
+      this.points -= g.cost
+      g.remain -= 1
+      this.addPointRecord(-g.cost, `兑换：${g.name}`, 'normal', { tenantId: g.tenantId, traceId: trace })
+      const rec = {
+        id: genId('rg'),
+        type: 'redeem',
+        status: 'normal',
+        tenantId: g.tenantId,
+        userId: this.user.id,
+        userName: this.user.name,
+        traceId: trace,
+        date: this.todayDate,
+        time: nowTime(),
+        ts: Date.now(),
+        goodsId: g.id,
+        goodsName: g.name,
+        couponId: g.couponId || '',
+        icon: g.icon
+      }
+      this.records.unshift(rec)
+      this.addAuditLog('redeem', rec.id, `积分兑换【${g.name}】，扣减 ${g.cost} 积分`, { module: 'points', tenantId: g.tenantId, traceId: trace })
+      // 券类商品：发券至卡券账户；实物商品生成发货单（其余虚拟权益直接到账）
+      const coupon = this.issueCouponForRecord(rec)
+      const ship = this.createShipment(rec)
+      if (coupon) this.showToast(`🎟️ 兑换成功：${g.name}，券码已发至「卡券核销」，有效期至 ${coupon.expireDate}`, 'success')
+      else if (ship) this.showToast(`兑换成功：${g.name}，请前往「物流发货」填写收货信息`, 'success')
+      else this.showToast(`兑换成功：${g.name}`, 'success')
+      this.endTrace()
+      return rec
+    },
+
+    // 冻结兑换：占用积分 + 预占商品库存
+    freezeRedeem(g, riskHits) {
+      const trace = currentTrace || this.beginTrace()
+      this.points -= g.cost
+      g.remain -= 1
+      g.frozen += 1
+      this.addPointRecord(-g.cost, `冻结：兑换【${g.name}】待风控审核`, 'frozen', { tenantId: g.tenantId, traceId: trace })
+      const rec = {
+        id: genId('rg'),
+        type: 'redeem',
+        status: 'frozen',
+        tenantId: g.tenantId,
+        userId: this.user.id,
+        userName: this.user.name,
+        traceId: trace,
+        date: this.todayDate,
+        time: nowTime(),
+        ts: Date.now(),
+        goodsId: g.id,
+        goodsName: g.name,
+        couponId: g.couponId || '',
+        icon: g.icon
+      }
+      this.records.unshift(rec)
+      const order = this.createRiskOrder({
+        bizType: 'redeem',
+        recordId: rec.id,
+        targetId: g.id,
+        targetName: g.name,
+        icon: g.icon,
+        cost: g.cost,
+        stockHeld: 1,
+        riskHits,
+        tenantId: g.tenantId
+      })
+      rec.riskOrderId = order.id
+      if (g.couponId) this.addCouponLog('hold', null, rec, { orderId: order.id, traceId: trace })
+      this.showToast('⚠️ 该笔兑换触发风控，积分与商品已冻结，可在「风控申诉」中查看/申诉', 'warn')
+      return rec
+    },
+
+    // ===== 风控审核单 =====
+    createRiskOrder({ bizType, recordId, activityId = null, targetId, targetName, icon, rarity = null, cost, stockHeld, riskHits, tenantId = this.activeTenantId }) {
+      const order = {
+        id: genId('rk'),
+        bizType,                    // draw | redeem
+        status: 'pending',          // pending | appealed | released | revoked
+        tenantId,
+        userId: this.user.id,
+        userName: this.user.name,
+        recordId,
+        activityId,
+        targetId,
+        targetName,
+        icon,
+        rarity,
+        frozenPoints: cost || 0,    // 冻结的成本积分
+        stockHeld,                  // 预占库存数量
+        rules: riskHits.map((code) => ({ code, label: RULE_LABELS[code] || code })),
+        appealReason: '',
+        appealAt: '',
+        reviewNote: '',
+        reviewer: '',
+        createdAt: this.todayDate,
+        time: nowTime(),
+        ts: Date.now(),
+        reviewedAt: ''
+      }
+      this.riskOrders.unshift(order)
+      this.addAuditLog('freeze', order.id,
+        `${bizType === 'draw' ? '抽奖' : '兑换'}【${targetName}】命中规则：${order.rules.map((r) => r.label).join('、')}，冻结${cost || 0}积分${stockHeld ? `、预占库存×${stockHeld}` : ''}${bizType === 'draw' ? '；该笔暂缓计入抽奖任务进度' : ''}`,
+        { module: 'risk', tenantId })
+      return order
+    },
+
+    // 用户申诉（仅本人、且单据处于待审核/已申诉可补充）
+    appealRisk(orderId, reason) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const o = this.riskOrders.find((x) => x.id === orderId)
+      if (!o) { this.endTrace(); return false }
+      if (this.role === 'operator') {
+        this.deny('appeal-denied', '运营视角无需申诉，请切换到用户视角', { module: 'risk', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.userId !== this.user.id) {
+        this.deny('appeal-denied', '只能对自己的单据申诉', { module: 'risk', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.status !== 'pending' && o.status !== 'appealed') {
+        this.showToast('该单据已处理，无法申诉', 'warn')
+        this.endTrace()
+        return false
+      }
+      if (!reason || !reason.trim()) {
+        this.showToast('请填写申诉理由', 'warn')
+        this.endTrace()
+        return false
+      }
+      o.status = 'appealed'
+      o.appealReason = reason.trim()
+      o.appealAt = `${this.todayDate} ${nowTime()}`
+      this.addAuditLog('appeal', o.id, `用户提交申诉：${o.appealReason}`, { module: 'risk', tenantId: o.tenantId, traceId: trace })
+      this.showToast('申诉已提交，等待运营审核', 'success')
+      this.endTrace()
+      return true
+    },
+
+    // 运营放行（幂等：仅 pending/appealed 可处理；RBAC：risk:review；数据隔离：仅本租户单）
+    releaseRisk(orderId, note = '') {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const o = this.riskOrders.find((x) => x.id === orderId)
+      if (!o) { this.endTrace(); return }
+      if (!this.requirePerm('risk:review', 'risk') || !this.requireSameTenant(o.tenantId, 'risk')) {
+        this.endTrace()
+        return
+      }
+      if (o.status !== 'pending' && o.status !== 'appealed') {
+        this.showToast('该单据已处理，请勿重复操作', 'warn')
+        this.endTrace()
+        return
+      }
+      const rec = this.records.find((r) => r.id === o.recordId)
+      if (!rec) {
+        this.showToast('关联业务记录缺失，无法处理', 'warn')
+        this.endTrace()
+        return
+      }
+
+      if (o.bizType === 'draw') {
+        // 核销预占库存（remain 已扣，仅清 frozen）
+        if (o.stockHeld) {
+          const act = this.activities.find((a) => a.id === o.activityId)
+          const prize = act?.prizes.find((p) => p.id === o.targetId)
+          if (prize) prize.frozen = Math.max(0, prize.frozen - 1)
+        }
+        // 积分奖品此刻才入账（归属原参与业务日；跨日审核时流水续在链尾、对账不串当日）
+        const n = parseInt(o.targetName) || 0
+        if (o.targetName.includes('积分') && n > 0) {
+          this.points += n
+          this.addPointRecord(n, `审核放行：抽奖奖品【${o.targetName}】`, 'release', {
+            bizDate: o.createdAt, tenantId: o.tenantId, traceId: trace
+          })
+        }
+      } else {
+        const g = this.goods.find((x) => x.id === o.targetId)
+        if (g) g.frozen = Math.max(0, g.frozen - 1)
+      }
+
+      o.status = 'released'
+      o.reviewNote = note
+      o.reviewer = this.user.name
+      o.reviewedAt = `${this.todayDate} ${nowTime()}`
+      rec.status = 'released'
+      this.addAuditLog('release', o.id,
+        `放行${o.bizType === 'draw' ? '抽奖' : '兑换'}【${o.targetName}】${note ? '；备注：' + note : ''}`,
+        { module: 'risk', tenantId: o.tenantId, traceId: trace })
+      // 放行后券类才"交付"：发券至卡券账户（冻结期仅预占库存、未发券）；实物则生成发货单
+      const coupon = this.issueCouponForRecord(rec, { orderId: o.id, source: '风控放行' })
+      // 放行后实物才"发奖"：生成发货单并通知用户填写收货信息（冻结期间不产生发货单）
+      const ship = this.createShipment(rec)
+      this.showToast(coupon
+        ? `已放行【${o.targetName}】，券码已发至卡券账户（有效期自放行日起算）`
+        : ship
+          ? `已放行【${o.targetName}】，发货单已生成，等待用户填写收货信息`
+          : `已放行【${o.targetName}】`, 'success')
+      // 抽奖放行后按记录归属业务日补计任务进度（跨日审核不串当日账，幂等防重复发奖）
+      if (o.bizType === 'draw') this.settleDrawTasks(rec.date, rec.tenantId)
+      this.endTrace()
+      return true
+    },
+
+    // 运营撤销：返还积分、回补库存、业务记录作废（幂等；RBAC：risk:review）
+    revokeRisk(orderId, note = '') {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const o = this.riskOrders.find((x) => x.id === orderId)
+      if (!o) { this.endTrace(); return }
+      if (!this.requirePerm('risk:review', 'risk') || !this.requireSameTenant(o.tenantId, 'risk')) {
+        this.endTrace()
+        return
+      }
+      if (o.status !== 'pending' && o.status !== 'appealed') {
+        this.showToast('该单据已处理，请勿重复操作', 'warn')
+        this.endTrace()
+        return
+      }
+      const rec = this.records.find((r) => r.id === o.recordId)
+      if (!rec) {
+        this.showToast('关联业务记录缺失，无法处理', 'warn')
+        this.endTrace()
+        return
+      }
+
+      // 返还冻结的成本积分
+      if (o.frozenPoints > 0) {
+        this.points += o.frozenPoints
+        this.addPointRecord(o.frozenPoints,
+          `撤销返还：${o.bizType === 'draw' ? '抽奖' : '兑换'}【${o.targetName}】`, 'refund',
+          { tenantId: o.tenantId, traceId: trace })
+      }
+      // 回补库存（remain 回补 + frozen 释放）
+      if (o.bizType === 'draw') {
+        if (o.stockHeld) {
+          const act = this.activities.find((a) => a.id === o.activityId)
+          const prize = act?.prizes.find((p) => p.id === o.targetId)
+          if (prize) {
+            prize.frozen = Math.max(0, prize.frozen - 1)
+            prize.remain += 1
+          }
+        }
+      } else {
+        const g = this.goods.find((x) => x.id === o.targetId)
+        if (g) {
+          g.frozen = Math.max(0, g.frozen - 1)
+          g.remain += 1
+        }
+      }
+
+      o.status = 'revoked'
+      o.reviewNote = note
+      o.reviewer = this.user.name
+      o.reviewedAt = `${this.todayDate} ${nowTime()}`
+      rec.status = 'revoked'
+      // 券类预占释放：冻结期未发券，撤销后券始终不存在；库存回补由下方统一处理
+      if (rec.couponId) this.addCouponLog('revoke', null, rec, { orderId: o.id, traceId: trace })
+      this.addAuditLog('revoke', o.id,
+        `撤销${o.bizType === 'draw' ? '抽奖' : '兑换'}【${o.targetName}】，返还${o.frozenPoints}积分${o.stockHeld ? `、回补库存×${o.stockHeld}` : ''}${rec.couponId ? '、释放预占券（未发放）' : ''}${o.bizType === 'draw' ? '；该笔不计入抽奖任务进度（冻结期间暂缓，撤销后确认回退）' : ''}${note ? '；备注：' + note : ''}`,
+        { module: 'risk', tenantId: o.tenantId, traceId: trace })
+      this.showToast(`已撤销【${o.targetName}】，积分与库存已返还`, 'info')
+      this.endTrace()
+    },
+
+    // ===== 实物收货 / 发货流程 =====
+    // 状态机：pending_address（待填地址）→ to_ship（待运营接单发货）→ shipped（已发货/待收货）→ received（已收货）
+    // 仅"有效"实物业务记录（正常落账 normal / 风控放行 released）生成发货单；
+    // 风控冻结中不生成（放行才发奖）、撤销作废不生成（已返还库存/积分）。
+    _isPhysicalRecord(rec) {
+      // 券类一律走卡券账户核销，不走物流
+      if (rec.couponId) return false
+      if (rec.type === 'draw') {
+        if (rec.rarity === 'none') return false
+        const prize = this.activities.find((a) => a.id === rec.activityId)
+          ?.prizes.find((p) => p.id === rec.prizeId)
+        if (prize && prize.physical !== undefined) return !!prize.physical
+        return !rec.prizeName.includes('积分') // 兜底：积分奖品为虚拟
+      }
+      const g = this.goods.find((x) => x.id === rec.goodsId)
+      if (g && g.physical !== undefined) return !!g.physical
+      return true // 兜底：商城商品默认实物
+    },
+
+    // 有效实物中奖/兑换 → 生成发货单（幂等：一条业务记录至多一张）
+    createShipment(rec) {
+      if (!rec) return null
+      if (rec.status !== 'normal' && rec.status !== 'released') return null
+      if (!this._isPhysicalRecord(rec)) return null
+      if (this.shipments.some((o) => o.recordId === rec.id)) return null
+      const isDraw = rec.type === 'draw'
+      const order = {
+        id: genId('sp'),
+        recordId: rec.id,
+        bizType: rec.type,                   // draw | redeem
+        status: 'pending_address',
+        tenantId: rec.tenantId || this.activeTenantId,
+        userId: rec.userId || this.user.id,
+        userName: rec.userName || this.user.name,
+        traceId: rec.traceId || currentTrace || '',
+        icon: rec.icon,
+        targetName: isDraw ? rec.prizeName : rec.goodsName,
+        activityId: isDraw ? rec.activityId : null,
+        source: rec.status === 'released' ? '风控放行' : (isDraw ? '中奖' : '积分兑换'),
+        date: this.todayDate, time: nowTime(), ts: Date.now(),
+        // 用户收货信息
+        receiver: '', phone: '', region: '', address: '', addressAt: '',
+        // 运营接单 / 发货
+        shipper: '', carrier: '', trackingNo: '', shipNote: '', shippedAt: '',
+        // 用户确认收货
+        receivedAt: '',
+        // 物流轨迹（append-only）：发货后同步快递节点 揽收→干线→派送→签收；售后退回/确认收货亦追加节点
+        traces: [],
+        // 售后回写：关联售后单与退回时间
+        afterSaleId: '', returnedAt: '', originId: ''
+      }
+      this.shipments.unshift(order)
+      this.addAuditLog('ship-create', order.id,
+        `${isDraw ? '中奖' : '兑换'}实物【${order.targetName}】生成发货单，待用户填写收货信息`,
+        { module: 'ship', tenantId: order.tenantId, traceId: order.traceId })
+      return order
+    },
+
+    // 用户填写 / 更新收货信息（仅本人；发货前可修改，提交后进入运营待发货队列）
+    submitShipAddress(shipmentId, form) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const o = this.shipments.find((x) => x.id === shipmentId)
+      if (!o) { this.endTrace(); return false }
+      if (this.role === 'operator') {
+        this.deny('ship-denied', '运营视角不代用户填写收货信息，请切换到用户视角', { module: 'ship', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.userId !== this.user.id || (o.tenantId || 't-star') !== this.activeTenantId) {
+        this.deny('ship-denied', '只能填写自己在当前租户的收货信息', { module: 'ship', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.status === 'shipped' || o.status === 'received') {
+        this.showToast('已发货，收货信息不可修改', 'warn')
+        this.endTrace()
+        return false
+      }
+      const receiver = (form.receiver || '').trim()
+      const phone = String(form.phone || '').replace(/[\s-]/g, '')
+      const region = (form.region || '').trim()
+      const address = (form.address || '').trim()
+      if (!receiver) { this.showToast('请填写收货人姓名', 'warn'); this.endTrace(); return false }
+      if (!/^1\d{10}$/.test(phone)) { this.showToast('请填写正确的 11 位手机号', 'warn'); this.endTrace(); return false }
+      if (!region) { this.showToast('请填写所在地区（省/市/区）', 'warn'); this.endTrace(); return false }
+      if (!address) { this.showToast('请填写详细收货地址', 'warn'); this.endTrace(); return false }
+      const first = o.status === 'pending_address'
+      o.receiver = receiver
+      o.phone = phone
+      o.region = region
+      o.address = address
+      o.status = 'to_ship'
+      o.addressAt = `${this.todayDate} ${nowTime()}`
+      this.addAuditLog('ship-address', o.id,
+        `${first ? '填写' : '更新'}收货信息：${receiver} ${phone.replace(/^(\d{3})\d{4}(\d{4})$/, '$1****$2')} ${region} ${address}`,
+        { module: 'ship', tenantId: o.tenantId, traceId: trace })
+      this.showToast(first ? '📮 收货信息已提交，等待运营接单发货' : '收货信息已更新', 'success')
+      this.endTrace()
+      return true
+    },
+
+    // 运营接单发货（RBAC：ship:send；仅本租户、仅 to_ship，幂等防重复发货）
+    shipShipment(shipmentId, form) {
+      const trace = this.beginTrace()
+      const o = this.shipments.find((x) => x.id === shipmentId)
+      if (!o) { this.endTrace(); return false }
+      if (!this.requirePerm('ship:send', 'ship') || !this.requireSameTenant(o.tenantId, 'ship')) {
+        this.endTrace()
+        return false
+      }
+      if (o.status !== 'to_ship') {
+        this.showToast('该发货单当前状态不可发货（需用户先填写收货信息）', 'warn')
+        this.endTrace()
+        return false
+      }
+      const carrier = (form.carrier || '').trim()
+      const trackingNo = (form.trackingNo || '').trim()
+      if (!carrier) { this.showToast('请填写快递公司', 'warn'); this.endTrace(); return false }
+      if (!trackingNo) { this.showToast('请填写快递单号', 'warn'); this.endTrace(); return false }
+      o.carrier = carrier
+      o.trackingNo = trackingNo
+      o.shipNote = (form.note || '').trim()
+      o.shipper = this.user.name
+      o.status = 'shipped'
+      o.shippedAt = `${this.todayDate} ${nowTime()}`
+      // 发货即生成首个物流节点（已揽收），后续由 syncShipmentTrace 同步快递轨迹
+      this._appendTrace(o, 'collected', `${carrier} 已揽收包裹（单号 ${trackingNo}）`)
+      this.addAuditLog('ship-send', o.id,
+        `接单发货【${o.targetName}】：${carrier} 单号 ${trackingNo}，收件人 ${o.receiver}（${o.region} ${o.address}）${o.shipNote ? '；备注：' + o.shipNote : ''}`,
+        { module: 'ship', tenantId: o.tenantId, traceId: trace })
+      this.showToast(`📦 已接单发货：${o.targetName}（${carrier} ${trackingNo}）`, 'success')
+      this.endTrace()
+      return true
+    },
+
+    // ===== 物流轨迹同步 =====
+    // 追加一个轨迹节点（append-only；节点时间取当前业务日/时刻）
+    _appendTrace(o, stage, text) {
+      const node = { stage, text, date: this.todayDate, time: nowTime(), ts: Date.now() }
+      o.traces.push(node)
+      return node
+    },
+    // 快递标准节点流：揽收 → 干线运输 → 派送 → 签收
+    _traceFlow(o) {
+      return [
+        { stage: 'collected', text: `${o.carrier} 已揽收包裹（单号 ${o.trackingNo}）` },
+        { stage: 'transit', text: `包裹离开揽收网点，干线运输中，发往【${o.region}】` },
+        { stage: 'delivering', text: `包裹到达【${o.region}】派送点，派送员王师傅 138****6666 正在派送` },
+        { stage: 'signed', text: '包裹已签收，签收人：本人' }
+      ]
+    },
+    // 同步快递轨迹：发货后每次同步向下推进一个节点（幂等：已到签收终态不再推进；退回/已收货单不推进）
+    // RBAC：员工需 ship:trace；客户仅可同步本人订单
+    syncShipmentTrace(shipmentId) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const o = this.shipments.find((x) => x.id === shipmentId)
+      if (!o) { this.endTrace(); return false }
+      if (this.role === 'operator') {
+        if (!this.requirePerm('ship:trace', 'ship') || !this.requireSameTenant(o.tenantId, 'ship')) {
+          this.endTrace()
+          return false
+        }
+      } else if (o.userId !== this.user.id || (o.tenantId || 't-star') !== this.activeTenantId) {
+        this.deny('ship-denied', '只能查询自己的物流轨迹', { module: 'ship', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.status !== 'shipped') {
+        this.showToast(o.status === 'returned' ? '该单已退回，物流已终止' : '当前状态无需同步物流', 'info')
+        this.endTrace()
+        return false
+      }
+      const flow = this._traceFlow(o)
+      const next = flow.find((f) => !o.traces.some((t) => t.stage === f.stage))
+      if (!next) {
+        this.showToast('物流已更新至最新（已签收）', 'info')
+        this.endTrace()
+        return false
+      }
+      this._appendTrace(o, next.stage, next.text)
+      this.addAuditLog('ship-trace', o.id,
+        `同步物流轨迹【${o.targetName}】（${o.carrier} ${o.trackingNo}）：${next.text}`,
+        { module: 'ship', tenantId: o.tenantId, traceId: trace })
+      this.showToast(`🚚 物流更新：${next.text}`, 'success')
+      this.endTrace()
+      return true
+    },
+
+    // 用户确认收货（仅本人、仅已发货可确认）
+    receiveShipment(shipmentId) {
+      const trace = this.beginTrace()
+      const o = this.shipments.find((x) => x.id === shipmentId)
+      if (!o) { this.endTrace(); return false }
+      if (this.role === 'operator') {
+        this.deny('ship-denied', '由用户本人确认收货，请切换到用户视角', { module: 'ship', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.userId !== this.user.id || (o.tenantId || 't-star') !== this.activeTenantId) {
+        this.deny('ship-denied', '只能确认自己的发货单', { module: 'ship', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return false
+      }
+      if (o.status !== 'shipped') { this.showToast('仅已发货的订单可确认收货', 'warn'); this.endTrace(); return false }
+      o.status = 'received'
+      o.receivedAt = `${this.todayDate} ${nowTime()}`
+      // 轨迹尚未同步到签收节点的，确认收货时补齐终态节点（幂等：已签收不重复追加）
+      if (!o.traces.some((t) => t.stage === 'signed')) {
+        this._appendTrace(o, 'signed', '包裹已签收，签收人：本人（用户确认收货）')
+      }
+      this.addAuditLog('ship-receive', o.id,
+        `确认收货【${o.targetName}】（${o.carrier} ${o.trackingNo}），订单完成`,
+        { module: 'ship', tenantId: o.tenantId, traceId: trace })
+      this.showToast(`✅ 已确认收货：${o.targetName}`, 'success')
+      this.endTrace()
+      return true
+    },
+
+    // ===== 售后闭环：拒收 / 退货 / 补发 =====
+    // 状态机：pending 待审核 → done 已完成（审核通过并回写）｜ dismissed 已驳回（不动账）
+    // 回写口径：拒收/退货 → 库存回补 + 积分返还（append-only refund 流水）+ 发货单→已退回；
+    //          补发 → 库存再扣 1 + 生成补发发货单（沿用原地址，不退款）。
+    // 异常回退：审核前统一校验（库存余量/单据状态），任一不满足则整体不落账；驳回不产生任何账务变动。
+    // 对账口径：售后退款计入 P1 应有净额（按审核日）；退回/补发计入 P5 有效消耗修正。
+
+    // 售后单关联的业务记录
+    _recordOfShipment(o) {
+      return this.records.find((r) => r.id === o.recordId) || null
+    },
+    // 业务记录对应的退款积分（售后返还口径：兑换成本 / 抽奖参与成本；免费抽奖为 0）
+    _refundOfRecord(rec) {
+      if (!rec) return 0
+      if (rec.type === 'draw') return this._drawCostOf(rec)
+      return this.goods.find((g) => g.id === rec.goodsId)?.cost || 0
+    },
+    // 业务记录对应的库存定位快照（售后单落账时固化，后续商品/奖品变更不影响勾稽）
+    _stockKeyOfRecord(rec) {
+      if (!rec) return {}
+      return rec.type === 'draw'
+        ? { targetType: 'prize', activityId: rec.activityId, targetId: rec.prizeId }
+        : { targetType: 'goods', activityId: null, targetId: rec.goodsId }
+    },
+    _stockTargetOf(snap) {
+      return snap.targetType === 'prize'
+        ? this.activities.find((a) => a.id === snap.activityId)?.prizes.find((p) => p.id === snap.targetId)
+        : this.goods.find((g) => g.id === snap.targetId)
+    },
+
+    // 用户申请售后（仅本人；类型与发货单状态匹配；同一发货单已有待审核单则幂等拦截）
+    applyAfterSale(shipmentId, type, reason) {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const o = this.shipments.find((x) => x.id === shipmentId)
+      if (!o) { this.endTrace(); return null }
+      if (this.role === 'operator') {
+        this.deny('aftersale-denied', '运营视角不代用户申请售后，请切换到用户视角', { module: 'aftersale', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return null
+      }
+      if (o.userId !== this.user.id || (o.tenantId || 't-star') !== this.activeTenantId) {
+        this.deny('aftersale-denied', '只能对自己的发货单申请售后', { module: 'aftersale', tenantId: o.tenantId, traceId: trace })
+        this.endTrace()
+        return null
+      }
+      const meta = AFTERSALE_TYPES[type]
+      if (!meta) { this.showToast('不支持的售后类型', 'warn'); this.endTrace(); return null }
+      // 状态机：拒收仅限已发货未签收；退货仅限已收货；补发限已发货/已收货
+      const allow = { reject: ['shipped'], return: ['received'], reship: ['shipped', 'received'] }[type]
+      if (!allow.includes(o.status)) {
+        this.showToast(`当前状态（${SHIP_STATUS[o.status]?.label || o.status}）不可申请${meta.label}`, 'warn')
+        this.endTrace()
+        return null
+      }
+      if (this.afterSales.some((a) => a.shipmentId === shipmentId && a.status === 'pending')) {
+        this.showToast('该发货单已有待审核的售后申请，请勿重复提交', 'warn')
+        this.endTrace()
+        return null
+      }
+      if (this.afterSales.some((a) => a.shipmentId === shipmentId && a.status === 'done' && a.type === type)) {
+        this.showToast(`该发货单已完成过${meta.label}售后，不可重复申请`, 'warn')
+        this.endTrace()
+        return null
+      }
+      const text = (reason || '').trim()
+      if (!text) { this.showToast('请填写售后原因', 'warn'); this.endTrace(); return null }
+      const rec = this._recordOfShipment(o)
+      const refund = type === 'reship' ? 0 : this._refundOfRecord(rec)
+      const as = {
+        id: genId('as'),
+        shipmentId: o.id,
+        recordId: o.recordId,
+        tenantId: o.tenantId || 't-star',
+        traceId: trace,
+        userId: o.userId,
+        userName: o.userName,
+        type,
+        typeLabel: meta.label,
+        reason: text,
+        status: 'pending',
+        icon: o.icon,
+        targetName: o.targetName,
+        ...this._stockKeyOfRecord(rec),
+        refundPoints: refund,          // 审核通过时返还的积分快照（补发为 0）
+        reshipmentId: '',              // 补发审核通过后生成的新发货单
+        createdAt: this.todayDate, time: nowTime(), ts: Date.now(),
+        reviewedAt: '', reviewer: '', reviewNote: ''
+      }
+      this.afterSales.unshift(as)
+      this.addAuditLog('aftersale-apply', as.id,
+        `用户申请${meta.label}【${o.targetName}】（发货单 ${o.id}，${o.carrier} ${o.trackingNo}）：${text}${refund ? `；待审核返还 ${refund} 积分` : ''}`,
+        { module: 'aftersale', tenantId: as.tenantId, traceId: trace })
+      this.showToast(`📮 ${meta.label}申请已提交，等待运营审核`, 'success')
+      this.endTrace()
+      return as
+    },
+
+    // 运营审核售后（幂等：仅 pending 可审；驳回不动账；通过则一次性回写库存/积分/发货单/台账）
+    // RBAC：aftersale:review；数据隔离：仅本租户售后单
+    reviewAfterSale(afterSaleId, approve, note = '') {
+      this.syncBusinessDay()
+      const trace = this.beginTrace()
+      const as = this.afterSales.find((x) => x.id === afterSaleId)
+      if (!as) { this.endTrace(); return false }
+      if (!this.requirePerm('aftersale:review', 'aftersale') || !this.requireSameTenant(as.tenantId, 'aftersale')) {
+        this.endTrace()
+        return false
+      }
+      if (as.status !== 'pending') {
+        this.showToast('该售后单已处理，请勿重复操作', 'warn')
+        this.endTrace()
+        return false
+      }
+      const o = this.shipments.find((x) => x.id === as.shipmentId)
+      if (!o) { this.showToast('关联发货单缺失，无法审核', 'warn'); this.endTrace(); return false }
+      const remark = (note || '').trim()
+
+      if (!approve) {
+        // 驳回：仅留痕，不产生任何账务/库存/状态变动
+        as.status = 'dismissed'
+        as.reviewedAt = `${this.todayDate} ${nowTime()}`
+        as.reviewer = this.user.name
+        as.reviewNote = remark
+        this.addAuditLog('aftersale-dismiss', as.id,
+          `驳回${as.typeLabel}申请【${as.targetName}】（发货单 ${o.id}）${remark ? '；备注：' + remark : ''}；账目与库存未变动`,
+          { module: 'aftersale', tenantId: as.tenantId, traceId: trace })
+        this.showToast(`已驳回【${as.targetName}】的${as.typeLabel}申请`, 'info')
+        this.endTrace()
+        return true
+      }
+
+      // —— 审核通过：先统一校验（异常回退：任一不满足整体不落账） ——
+      const target = this._stockTargetOf(as)
+      if (!target) { this.showToast('关联库存目标缺失，无法执行回写', 'warn'); this.endTrace(); return false }
+      if (as.type === 'reship' && target.remain <= 0) {
+        this.showToast(`补发失败：【${as.targetName}】库存不足（remain=0），请先补货或驳回该申请`, 'warn')
+        this.endTrace()
+        return false
+      }
+
+      if (as.type === 'reject' || as.type === 'return') {
+        // 拒收/退货：库存回补 + 积分返还 + 发货单 → 已退回
+        target.remain += 1
+        if (as.refundPoints > 0) {
+          this.points += as.refundPoints
+          this.addPointRecord(as.refundPoints,
+            `售后退款：${as.typeLabel}【${as.targetName}】（发货单 ${o.id}）`, 'refund',
+            { refId: as.id, refType: 'after-sale', tenantId: as.tenantId, traceId: trace })
+        }
+        o.status = 'returned'
+        o.returnedAt = `${this.todayDate} ${nowTime()}`
+        o.afterSaleId = as.id
+        this._appendTrace(o, 'returned',
+          as.type === 'reject' ? '收件人拒收，包裹退回发货仓' : '退货包裹已退回发货仓，售后完成')
+      } else {
+        // 补发：库存再扣 1，生成补发发货单（沿用原收货信息，直接待发货；原单保留轨迹节点）
+        target.remain -= 1
+        const reship = {
+          id: genId('sp'),
+          recordId: o.recordId,
+          bizType: o.bizType,
+          status: 'to_ship',
+          tenantId: as.tenantId,
+          traceId: trace,
+          userId: o.userId, userName: o.userName,
+          icon: o.icon, targetName: o.targetName, activityId: o.activityId,
+          source: '售后补发',
+          date: this.todayDate, time: nowTime(), ts: Date.now(),
+          receiver: o.receiver, phone: o.phone, region: o.region, address: o.address,
+          addressAt: o.addressAt,
+          shipper: '', carrier: '', trackingNo: '', shipNote: '', shippedAt: '',
+          receivedAt: '', traces: [],
+          afterSaleId: as.id, returnedAt: '', originId: o.id
+        }
+        this.shipments.unshift(reship)
+        as.reshipmentId = reship.id
+        this._appendTrace(o, 'reship', `售后补发已受理，生成补发单 ${reship.id}，等待重新发货`)
+        this.addAuditLog('ship-create', reship.id,
+          `售后补发【${o.targetName}】生成补发发货单（原单 ${o.id}，售后单 ${as.id}），沿用原收货信息，待运营重新发货`,
+          { module: 'ship', tenantId: as.tenantId, traceId: trace })
+      }
+
+      as.status = 'done'
+      as.reviewedAt = `${this.todayDate} ${nowTime()}`
+      as.reviewer = this.user.name
+      as.reviewNote = remark
+      this.addAuditLog('aftersale-approve', as.id,
+        as.type === 'reship'
+          ? `同意补发【${as.targetName}】：库存扣减 1，生成补发单 ${as.reshipmentId}${remark ? '；备注：' + remark : ''}`
+          : `同意${as.typeLabel}【${as.targetName}】：库存回补 1${as.refundPoints ? `、返还 ${as.refundPoints} 积分` : ''}，发货单 ${o.id} 已退回${remark ? '；备注：' + remark : ''}`,
+        { module: 'aftersale', tenantId: as.tenantId, traceId: trace })
+      this.showToast(
+        as.type === 'reship'
+          ? `✅ 已同意补发：新发货单已生成（库存 -1），等待运营发货`
+          : `✅ 已同意${as.typeLabel}：库存回补 1${as.refundPoints ? `，${as.refundPoints} 积分已返还` : ''}`,
+        'success')
+      this.endTrace()
+      return true
+    },
+
+    // ===== 卡券账户与核销 =====
+    // 生命周期：中奖/兑换有效后发券（issue）；风控冻结时只预占库存（hold，不发券），
+    //          放行后交付发券（deliver），撤销释放预占（revoke，券从未发出）；
+    //          用户出示券码、运营扫码/输码核销（redeem）；到期自动失效（expire）。
+    // 券码全局唯一；状态机保证重复核销、过期核销被拦截；券实例、卡券台账 append-only。
+
+    // 卡券业务台账（append-only，核销/发券留痕，不裁剪）
+    addCouponLog(action, couponId, rec, extra = {}) {
+      const tpl = rec?.couponId ? (this.couponTpls[rec.couponId] || null) : null
+      const log = {
+        id: genId('cl'),
+        action,                                 // issue | hold | deliver | revoke | redeem | expire | comp
+        actionLabel: {
+          issue: '卡券发放', hold: '风控预占', deliver: '放行交付', revoke: '撤销释放',
+          redeem: '卡券核销', expire: '到期失效', comp: '对账补券'
+        }[action] || action,
+        couponId: couponId || '',
+        code: extra.code || '',
+        tplId: rec?.couponId || extra.tplId || '',
+        tplName: tpl?.name || extra.tplName || rec?.prizeName || rec?.goodsName || '',
+        recordId: rec?.id || extra.recordId || '',
+        bizType: rec?.type || extra.bizType || '',
+        orderId: extra.orderId || '',
+        tenantId: extra.tenantId || rec?.tenantId || this.activeTenantId,
+        traceId: extra.traceId || rec?.traceId || currentTrace || '',
+        operator: this.role === 'operator' ? `运营(${this.user.name})` : (extra.operator || this.user.name),
+        note: extra.note || '',
+        date: this.todayDate,
+        time: nowTime(),
+        ts: Date.now()
+      }
+      this.couponLogs.unshift(log)
+      if (this.couponLogs.length > 500) this.couponLogs.pop()
+      return log
+    },
+
+    // 生成全局唯一券码（大写字母+数字，剔除易混字符；碰撞重取）
+    _genCouponCode() {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+      for (let i = 0; i < 10; i++) {
+        let body = ''
+        for (let j = 0; j < 10; j++) body += chars[Math.floor(Math.random() * chars.length)]
+        const code = `CP-${body.slice(0, 5)}-${body.slice(5)}`
+        if (!this.coupons.some((c) => c.code === code)) return code
+      }
+      return `CP-${genId('x').toUpperCase()}`
+    },
+
+    // 券码归一化：去空白/横杠后比较，容忍用户输入空格、小写、连字符
+    _normCode(code) {
+      return String(code || '').replace(/[\s-]/g, '').toUpperCase()
+    },
+
+    // 按券码查券实例（归一化匹配）
+    couponByCode(code) {
+      const key = this._normCode(code)
+      if (!key) return null
+      return this.coupons.find((c) => this._normCode(c.code) === key) || null
+    },
+
+    // 计算有效期（自指定业务日起 validityDays 天，到期日 23:59:59.999）
+    _couponExpiry(tpl, fromDate) {
+      const d = new Date(`${fromDate} 00:00:00`)
+      d.setDate(d.getDate() + Math.max(0, (tpl.validityDays || 30) - 1))
+      d.setHours(23, 59, 59, 999)
+      const m = String(d.getMonth() + 1).padStart(2, '0')
+      const day = String(d.getDate()).padStart(2, '0')
+      return { ts: d.getTime(), date: `${d.getFullYear()}-${m}-${day}` }
+    },
+
+    // 有效业务记录（normal/released）发券至卡券账户；幂等：一条业务记录至多一张券。
+    // 风控放行交付时有效期以放行日（今日）起算；正常中奖/兑换以当日起算。
+    issueCouponForRecord(rec, opts = {}) {
+      if (!rec) return null
+      if (rec.status !== 'normal' && rec.status !== 'released') return null
+      if (!rec.couponId) return null
+      if (this.coupons.some((c) => c.recordId === rec.id)) return null
+      const tpl = this.couponTpls[rec.couponId]
+      if (!tpl) return null
+      const isDraw = rec.type === 'draw'
+      const tid = rec.tenantId || this.activeTenantId
+      const exp = this._couponExpiry(tpl, this.todayDate)
+      const coupon = {
+        id: genId('cp'),
+        code: this._genCouponCode(),
+        tplId: tpl.id,
+        name: tpl.name,
+        type: tpl.type,
+        typeLabel: COUPON_TYPES[tpl.type]?.label || tpl.type,
+        emoji: tpl.emoji,
+        denomination: tpl.denomination || 0,
+        threshold: tpl.threshold || 0,
+        face: tpl.face || '',
+        desc: tpl.desc || '',
+        validityDays: tpl.validityDays || 30,
+        status: 'available',                // available | redeemed | expired
+        tenantId: tid,
+        userId: rec.userId || this.user.id,
+        userName: rec.userName || this.user.name,
+        recordId: rec.id,
+        bizType: rec.type,
+        activityId: isDraw ? rec.activityId : null,
+        source: opts.source || (rec.status === 'released' ? '风控放行' : (isDraw ? '中奖' : '积分兑换')),
+        issueDate: this.todayDate,
+        time: nowTime(),
+        ts: Date.now(),
+        traceId: rec.traceId || currentTrace || '',
+        expireDate: exp.date,
+        expireTs: exp.ts,
+        // 核销信息（运营核销时补全）
+        redeemedAt: '', redeemOperator: '', redeemChannel: (opts.channel || '到店扫码'), redeemNote: '',
+        // 补券标记（对账补记时关联差异单）
+        compensateBillId: opts.compensateBillId || '',
+        comp: !!opts.compensateBillId
+      }
+      this.coupons.unshift(coupon)
+      const action = coupon.source === '风控放行' ? 'deliver' : 'issue'
+      this.addCouponLog(action, coupon.id, rec, { code: coupon.code, orderId: opts.orderId || rec.riskOrderId || '', tenantId: tid })
+      this.addAuditLog(
+        action === 'deliver' ? 'coupon-deliver' : 'coupon-issue',
+        rec.riskOrderId || '',
+        `发放卡券【${tpl.name}】（券码 ${coupon.code}，有效期至 ${exp.date}）：${isDraw ? `抽奖中奖【${rec.prizeName}】` : `积分兑换【${rec.goodsName}】`}${action === 'deliver' ? '，风控放行后交付（有效期自放行日起算）' : ''}`,
+        { module: 'coupon', tenantId: tid }
+      )
+      return coupon
+    },
+
+    // 到期扫描：过期 available 券批量流转为 expired（幂等：只处理仍可用且到期的券；跨租户全部扫描）
+    // 任何业务动作与运营核销前都会先经 syncBusinessDay 调用，杜绝出示/核销已过期券。
+    sweepCouponExpiry(silent = false) {
+      const now = Date.now()
+      const due = this.coupons.filter((c) => c.status === 'available' && c.expireTs < now)
+      if (!due.length) return 0
+      due.forEach((c) => {
+        c.status = 'expired'
+        const rec = this.records.find((r) => r.id === c.recordId) || null
+        this.addCouponLog('expire', c.id, rec, { code: c.code, tplId: c.tplId, tplName: c.name, tenantId: c.tenantId })
+      })
+      // 按租户汇总留痕，审计归属取当前上下文（系统扫描），日志明细带各租户券码
+      const byTenant = {}
+      due.forEach((c) => {
+        const k = c.tenantId || 't-star'
+        byTenant[k] = byTenant[k] || []
+        byTenant[k].push(c)
+      })
+      Object.keys(byTenant).forEach((tid) => {
+        const list = byTenant[tid]
+        this.addAuditLog('coupon-expire', null,
+          `卡券到期扫描：${list.length} 张券已过期失效（${list.map((c) => `${c.name} ${c.code}`).join('；')}）`,
+          { module: 'coupon', tenantId: tid, silent: true })
+      })
+      if (!silent) this.showToast(`⏰ ${due.length} 张卡券已到期，自动标记为已过期`, 'info')
+      return due.length
+    },
+
+    // 运营按券码核销：校验归属/状态/有效期，状态机幂等防重复核销
+    // RBAC：coupon:redeem；数据隔离：仅可核销当前数据上下文租户的券（跨租户券码视为不存在并留痕）
+    redeemCoupon(code, form = {}) {
+      this.syncBusinessDay() // 核销前先做到期流转
+      const trace = this.beginTrace()
+      if (!this.requirePerm('coupon:redeem', 'coupon')) { this.endTrace(); return null }
+      const c = this.couponByCode(code)
+      if (!c || (c.tenantId || 't-star') !== this.activeTenantId) {
+        if (c) {
+          this.deny('cross-tenant-denied',
+            `券码 ${c.code} 属于其他租户，当前账号无权核销（数据强隔离）`,
+            { module: 'coupon', tenantId: c.tenantId, traceId: trace })
+        } else {
+          this.showToast('券码不存在，请核对后重试', 'warn')
+        }
+        this.endTrace()
+        return null
+      }
+      if (c.status === 'redeemed') {
+        this.showToast(`该券码已核销（${c.redeemedAt}，核销人 ${c.redeemOperator}），请勿重复核销`, 'warn')
+        this.endTrace()
+        return { duplicated: true, coupon: c }
+      }
+      if (c.status === 'expired' || c.expireTs < Date.now()) {
+        // 双重保险：到期扫描未覆盖到（如系统时钟跳变）也不允许核销
+        if (c.status !== 'expired') {
+          c.status = 'expired'
+          const rec = this.records.find((r) => r.id === c.recordId) || null
+          this.addCouponLog('expire', c.id, rec, { code: c.code, tplId: c.tplId, tplName: c.name, tenantId: c.tenantId, traceId: trace })
+        }
+        this.showToast(`该券已于 ${c.expireDate} 到期，无法核销`, 'warn')
+        this.endTrace()
+        return { expired: true, coupon: c }
+      }
+      const note = (form.note || '').trim()
+      const channel = (form.channel || '到店扫码').trim() || '到店扫码'
+      c.status = 'redeemed'
+      c.redeemedAt = `${this.todayDate} ${nowTime()}`
+      c.redeemOperator = this.user.name
+      c.redeemChannel = channel
+      c.redeemNote = note
+      const rec = this.records.find((r) => r.id === c.recordId) || null
+      this.addCouponLog('redeem', c.id, rec, { code: c.code, note: note ? `${channel}：${note}` : channel, tenantId: c.tenantId, traceId: trace })
+      this.addAuditLog('coupon-redeem', '',
+        `核销卡券【${c.name}】券码 ${c.code}（用户 ${c.userName}，渠道 ${channel}，有效期至 ${c.expireDate}）${note ? '；备注：' + note : ''}`,
+        { module: 'coupon', tenantId: c.tenantId, traceId: trace })
+      this.showToast(`✅ 核销成功：${c.name}（${c.code}）`, 'success')
+      this.endTrace()
+      return { coupon: c }
+    },
+
+    // 演示注入：让一笔已发券在账户中"凭空消失"（业务记录在、券账户漏发），由 P6 检出并补券。
+    // 稳定选取满减券类（与库存注入固定选 g1 同理），优先种子券、其次任意待核销满减券。
+    injectCouponGap() {
+      this.syncBusinessDay()
+      const d = this.todayDate
+      const tid = this.activeTenantId
+      if (this.couponLogs.some((l) => l.action === 'comp' && l.date === d && (l.tenantId || 't-star') === tid)) {
+        this.showToast('今日已注入过卡券漏发差异，请勿重复注入', 'warn')
+        return
+      }
+      const c = this.scopedCoupons.find((x) => x.status === 'available' && x.tplId === 'c-discount-10')
+        || this.scopedCoupons.find((x) => x.status === 'available')
+      if (!c) { this.showToast('当前租户没有待核销券，无法注入漏发差异', 'warn'); return }
+      const rec = this.records.find((r) => r.id === c.recordId) || null
+      const removedName = c.name
+      const removedRecordId = c.recordId
+      this.coupons = this.coupons.filter((x) => x.id !== c.id)
+      // 登记一条注入痕迹（区别于真实补券：带 inject 标记，不写 coupon 实例）
+      this.addCouponLog('revoke', '', rec, { tplId: c.tplId, tplName: c.name, note: '【演示注入】券账户漏发：业务记录有效、券实例缺失', tenantId: tid })
+      this.addAuditLog('recon-inject', '',
+        `【演示注入】${d} 卡券【${removedName}】业务记录 ${removedRecordId} 有效但券账户实例漏发，等待 P6 对账检出`,
+        { module: 'recon', tenantId: tid })
+      this.showToast(`🔧 已注入演示差异：卡券【${removedName}】账户漏发（业务记录在、券缺失）`, 'warn')
+    },
+
+    // 更新风控规则（RBAC：risk:rule；仅本租户规则，不影响其他租户的抽奖/兑换判定）
+    updateRiskRules(patch) {
+      if (!this.requirePerm('risk:rule', 'risk')) return false
+      const trace = this.beginTrace()
+      const tid = this.activeTenantId
+      const before = this.ensureRiskRules(tid)
+      // 数组字段取独立副本，避免与其他租户/表单对象共享引用
+      const next = {
+        ...before,
+        ...patch,
+        highValueRarities: patch.highValueRarities ? [...patch.highValueRarities] : before.highValueRarities,
+        blacklist: patch.blacklist ? [...patch.blacklist] : before.blacklist
+      }
+      this.riskRulesByTenant[tid] = next
+      const changes = []
+      Object.keys(patch).forEach((k) => {
+        if (JSON.stringify(before[k]) !== JSON.stringify(next[k])) {
+          changes.push(`${k}: ${JSON.stringify(before[k])} → ${JSON.stringify(next[k])}`)
+        }
+      })
+      this.addAuditLog('config', null,
+        `【${this.activeTenant.shortName}】调整规则：${changes.join('；') || '规则配置已保存（无变化）'}`,
+        { module: 'risk', tenantId: tid, traceId: trace })
+      this.showToast('风控规则已更新', 'success')
+      this.endTrace()
+      return true
+    },
+
+    saveDayLog() {
+      // 业务动作落账前确保业务日一致（统一走业务日切换）
+      this.syncBusinessDay()
+      return true
+    },
+
+    // ===== 积分库存对账 =====
+    // 对账口径（按业务日 D）：
+    //  P1 积分发生额：业务侧（抽奖成本/中奖积分、兑换成本/撤销返还、任务奖励）推导的应有净额
+    //                vs 积分流水实际净额（补偿流水单列），残差即少记/多记
+    //  P2 任务奖励台账：taskClaims 每笔领奖必须有对应流水（台账 id 精确勾稽，跨日补计按 bizDate 归属）
+    //  P3 余额链：append-only 流水余额快照逐笔连续，且最新一行余额 == 当前可用积分（安全网）
+    //  P4 冻结单据（当前态）：在审单与业务记录状态一致、冻结积分=业务成本、预占库存=账面 frozen
+    //  P5 库存账实（当前态）：应有 remain = 初始库存 - 有效消耗 + 库存校正，与实物账逐 SKU 比对
+    //
+    // 幂等：一业务日一张差异单，签名（各类残差指纹）不变即同一版本；重复执行只追加执行痕迹，不重建、不重复补偿。
+    // 跨日：补偿流水带 bizDate 归属原业务日、date 为实际处理日；风控放行/撤销的积分动作按审核日入账。
+    // 留痕：原始流水/业务记录/库存行永不改写，所有修正只追加补偿流水与库存校正台账。
+
+    _flowBizDate(p) {
+      return p.bizDate || p.date
+    },
+    // 领奖台账的已入账流水：新数据按 claimId 精确勾稽；历史种子/旧数据保留备注模糊匹配兜底。——按租户范围匹配
+    _taskClaimFlow(claim, usedFlowIds = new Set(), tenantId = this.activeTenantId) {
+      const inT = (p) => (p.tenantId || 't-star') === (tenantId || 't-star')
+      const linked = this.pointRecords.find((p) =>
+        inT(p) && p.refType === 'task-claim' && p.refId === claim.id
+      )
+      if (linked) return linked
+      const comp = this.pointRecords.find((p) =>
+        inT(p) && !usedFlowIds.has(p.id) && p.kind === 'task-comp' && p.refId === claim.id
+      )
+      if (comp) return comp
+      if (claim.flowId) {
+        const byLedger = this.pointRecords.find((p) => p.id === claim.flowId && inT(p))
+        if (byLedger) return byLedger
+      }
+      return this.pointRecords.find((p) =>
+        inT(p) && !usedFlowIds.has(p.id) && p.kind === 'reward' &&
+        this._flowBizDate(p) === claim.bizDate && p.delta === claim.reward &&
+        p.note.includes('任务结算') && p.note.includes(claim.taskLabel)
+      ) || null
+    },
+    _orderOfRecord(recordId) {
+      return this.riskOrders.find((o) => o.recordId === recordId)
+    },
+    _reviewDate(order) {
+      return (order?.reviewedAt || '').slice(0, 10)
+    },
+    // 抽奖记录对应的积分成本（免费活动为 0）
+    _drawCostOf(rec) {
+      const act = this.activities.find((a) => a.id === rec.activityId)
+      return act && act.costType === 'points' ? (act.cost || 0) : 0
+    },
+    // 抽奖中奖积分（仅积分奖品）
+    _drawPrizePoints(rec) {
+      return rec.prizeName && rec.prizeName.includes('积分') ? (parseInt(rec.prizeName) || 0) : 0
+    },
+
+    // 计算某租户某业务日的对账差异（纯推导，不落库；补偿流水/校正台账参与勾稽）
+    computeReconDiffs(date, tenantId = this.activeTenantId) {
+      const tid = tenantId
+      const inT = (x) => (x.tenantId || 't-star') === tid
+      const recordsT = this.records.filter(inT)
+      const flowsAllT = this.pointRecords.filter(inT)
+      const ordersT = this.riskOrders.filter(inT)
+      const afterSalesT = this.afterSales.filter(inT)
+      const claimsT = this.taskClaims.filter(inT)
+      const stockAdjT = this.stockAdjustments.filter(inT)
+      const couponsT = this.coupons.filter(inT)
+      const actsT = this.activities.filter((a) => a.tenantId === tid)
+      const goodsT = this.goods.filter((g) => (g.tenantId || 't-star') === tid)
+      const flowsOn = (d) => flowsAllT.filter((p) => this._flowBizDate(p) === d)
+      const isComp = (p) => p.kind === 'recon-comp' || p.kind === 'task-comp'
+      const dayFlows = flowsOn(date)
+
+      // —— P1 积分发生额 ——
+      // 业务侧逐笔推导应有流水（同日同额合成明细，供差异单展示勾稽过程）
+      const expectedDetail = []
+      let expectedNet = 0
+      const pushExpect = (delta, label, effDate) => {
+        if (effDate !== date) return
+        expectedNet += delta
+        expectedDetail.push({ delta, label })
+      }
+      recordsT.forEach((r) => {
+        if (r.type === 'draw') {
+          // 成本：落账即扣（正常/冻结/撤销都曾扣减），撤销返还按审核日另计
+          const cost = this._drawCostOf(r)
+          if (cost) pushExpect(-cost, `抽奖成本：${r.activityName}`, r.date)
+          // 中奖积分：正常按参与日入账；放行按审核日入账；撤销/冻结中无
+          const prize = this._drawPrizePoints(r)
+          if (prize && r.status === 'normal') pushExpect(prize, `抽奖中奖：${r.prizeName}`, r.date)
+          // 放行发奖流水归属原参与业务日（实际发放日见流水 date，跨日不串当日净额）
+          if (prize && r.status === 'released') pushExpect(prize, `审核放行发奖：${r.prizeName}（${this._reviewDate(this._orderOfRecord(r.id))} 入账）`, r.date)
+          // 撤销返还冻结成本（按审核日）
+          if (r.status === 'revoked') {
+            const o = this._orderOfRecord(r.id)
+            if (o?.frozenPoints) pushExpect(o.frozenPoints, '撤销返还：抽奖冻结积分', this._reviewDate(o))
+          }
+        } else if (r.type === 'redeem') {
+          const g = goodsT.find((x) => x.id === r.goodsId)
+          const cost = g?.cost || 0
+          if (cost) pushExpect(-cost, `兑换扣减：${r.goodsName}`, r.date)
+          if (r.status === 'revoked') {
+            const o = this._orderOfRecord(r.id)
+            if (o?.frozenPoints) pushExpect(o.frozenPoints, '撤销返还：兑换冻结积分', this._reviewDate(o))
+          }
+        }
+      })
+      // 手动任务奖励：以 reward 类"完成任务"流水为业务凭证（补记的 task-comp 补偿流不计入应有发生额）
+      dayFlows.forEach((p) => {
+        if (!isComp(p) && p.kind === 'reward' && p.note.startsWith('完成任务：')) {
+          expectedNet += p.delta
+          expectedDetail.push({ delta: p.delta, label: p.note })
+        }
+      })
+      // 抽奖任务台账：归属业务日为 bizDate（跨日补计计入原业务日，不串审核当日账）；
+      // 实际发放日 grantDate 记录在台账与流水上。缺记台账无流水，体现为 P1 残差由 P2 逐笔列出。
+      claimsT.forEach((c) => {
+        if (c.bizDate === date) {
+          expectedNet += c.reward
+          expectedDetail.push({
+            delta: c.reward,
+            label: `任务结算：${c.taskLabel}${c.grantDate !== c.bizDate ? `（${c.grantDate} 跨日补计）` : ''}`
+          })
+        }
+      })
+      // 售后退款：已完成的拒收/退货按审核日返还积分（补发不退款）；退款流水 kind=refund 同日入账勾稽
+      afterSalesT.forEach((a) => {
+        if (a.status === 'done' && a.refundPoints > 0) {
+          pushExpect(a.refundPoints, `售后退款：${a.typeLabel}【${a.targetName}】（${a.createdAt} 申请）`,
+            (a.reviewedAt || '').slice(0, 10))
+        }
+      })
+
+      const ledgerNet = dayFlows.filter((p) => !isComp(p)).reduce((s, p) => s + p.delta, 0)
+      const compNet = dayFlows.filter(isComp).reduce((s, p) => s + p.delta, 0)
+      const residual = expectedNet - ledgerNet - compNet
+
+      // —— P2 任务奖励逐笔勾稽（按归属业务日 bizDate；跨日补计的流水带相同 bizDate） ——
+      // 原始发奖流与 task-comp 补偿流统一按 task-claim 台账 id 判重；旧流水无 refId 时才按任务名兜底匹配。
+      const usedFlowIds = new Set()
+      const taskItems = claimsT
+        .filter((c) => c.bizDate === date)
+        .map((c) => {
+          const flow = this._taskClaimFlow(c, usedFlowIds, tid)
+          if (flow) { usedFlowIds.add(flow.id); return null }
+          return {
+            key: `task-${c.id}`, claimId: c.id, label: c.taskLabel, reward: c.reward,
+            bizDate: c.bizDate, grantDate: c.grantDate, autoFixable: true
+          }
+        })
+        .filter(Boolean)
+      // P1 残差 = 应有净额 − 原始流水净额 − 已补偿净额；P2 缺笔是其中的逐笔明细
+      const pointsResidual = residual
+
+      // —— P3 余额链连续性（当前态安全网；按租户自己的流水窗口校验） ——
+      // 多租户余额为平台钱包，其他租户流水会与本租户交错，因此以"本租户第一条流水之前的全局余额"
+      // 作为起点重放本租户全部流水：快照逐笔连续即链路完好（可检出真实快照篡改/错行）。
+      const sorted = [...flowsAllT].sort((a, b) => a.ts - b.ts)
+      const sortedAll = [...this.pointRecords].sort((a, b) => a.ts - b.ts)
+      const firstTs = sorted.length ? sorted[0].ts : Infinity
+      const before = sortedAll.filter((p) => p.ts < firstTs).reduce((s, p) => s + p.delta, 0)
+      let bal = this.points - sortedAll.reduce((s, p) => s + p.delta, 0) + before
+      let brokenRows = 0
+      let firstBad = null
+      sorted.forEach((p) => {
+        bal += p.delta
+        if (p.balance !== bal) {
+          brokenRows += 1
+          if (!firstBad) firstBad = { id: p.id, expect: bal, actual: p.balance, note: p.note, date: p.date }
+        }
+      })
+      const head = sorted[sorted.length - 1]
+      const headBad = head && (() => {
+        // 该租户最后一条流水之后若还有其他租户流水，则其快照不等于当前全局余额属正常；只校验自身窗口连续性
+        const afterDelta = sortedAll.filter((p) => p.ts > head.ts).reduce((s, p) => s + p.delta, 0)
+        return head.balance + afterDelta !== this.points
+      })()
+      const chainItem = (brokenRows > 0 || headBad) ? {
+        brokenRows,
+        firstBad,
+        headBalance: head ? head.balance : null,
+        pointsBalance: this.points,
+        autoFixable: false   // 不直接改余额/快照；P1/P2 补偿使余额与流水同步后自愈
+      } : null
+
+      // —— P4 风控冻结单据一致性（当前态） ——
+      const frozenItems = []
+      const heldByTarget = new Map()
+      ordersT.filter((o) => o.status === 'pending' || o.status === 'appealed').forEach((o) => {
+        // 预占键：奖品按 活动id+奖品id（不同活动奖品 id 可能重复），商品按 goodsId
+        const key = o.bizType === 'draw' ? `prize:${o.activityId}:${o.targetId}` : `goods:${o.targetId}`
+        heldByTarget.set(key, (heldByTarget.get(key) || 0) + (o.stockHeld || 0))
+        const rec = recordsT.find((r) => r.id === o.recordId)
+        if (!rec || rec.status !== 'frozen') {
+          frozenItems.push({ key: `order-status-${o.id}`, orderId: o.id, kind: 'order-status',
+            target: o.targetName, expect: '业务记录冻结中', actual: rec ? rec.status : '记录缺失', autoFixable: false })
+        }
+        const expectCost = o.bizType === 'draw'
+          ? (actsT.find((a) => a.id === o.activityId)?.costType === 'points'
+              ? (actsT.find((a) => a.id === o.activityId)?.cost || 0) : 0)
+          : (goodsT.find((g) => g.id === o.targetId)?.cost || 0)
+        if ((o.frozenPoints || 0) !== expectCost) {
+          frozenItems.push({ key: `order-points-${o.id}`, orderId: o.id, kind: 'order-points',
+            target: o.targetName, expect: expectCost, actual: o.frozenPoints || 0, autoFixable: false })
+        }
+      })
+      // 预占库存 vs 账面 frozen（key 形如 prize:act-1:p1 / goods:g1）
+      const checkHeld = (key, name, book) => {
+        const held = heldByTarget.get(key) || 0
+        if (held !== (book || 0)) {
+          frozenItems.push({ key: `held-${key}`, kind: 'stock-held',
+            target: name, expect: held, actual: book || 0, autoFixable: false })
+        }
+      }
+      actsT.forEach((a) => a.prizes.forEach((p) => {
+        if (p.rarity !== 'none') checkHeld(`prize:${a.id}:${p.id}`, `${a.name} / ${p.name}`, p.frozen)
+      }))
+      goodsT.forEach((g) => checkHeld(`goods:${g.id}`, g.name, g.frozen))
+
+      // —— P5 库存账实（当前态；应有 = 初始库存 - 有效消耗 + 已校正） ——
+      // 有效消耗含售后修正：已完成的拒收/退货回补库存（消耗 -1），已完成的补发再消耗（+1）
+      const consumedAllOf = (test) => recordsT.filter((r) => r.status !== 'revoked' && test(r)).length
+      const doneAfterSales = afterSalesT.filter((a) => a.status === 'done')
+      const afterSaleOf = (targetType, activityId, targetId) => {
+        const hit = doneAfterSales.filter((a) => a.targetType === targetType &&
+          a.targetId === targetId && (targetType !== 'prize' || a.activityId === activityId))
+        return {
+          returned: hit.filter((a) => a.type === 'reject' || a.type === 'return').length,
+          reshipped: hit.filter((a) => a.type === 'reship').length
+        }
+      }
+      const stockItems = []
+      const pushStock = (targetType, activityId, id, name, icon, item) => {
+        const isPrize = targetType === 'prize'
+        const heldKey = isPrize ? `prize:${activityId}:${id}` : `goods:${id}`
+        const consumedBase = isPrize
+          ? consumedAllOf((r) => r.type === 'draw' && r.activityId === activityId && r.prizeId === id)
+          : consumedAllOf((r) => r.type === 'redeem' && r.goodsId === id)
+        const asFix = afterSaleOf(targetType, activityId, id)
+        const consumed = consumedBase - asFix.returned + asFix.reshipped
+        const adjusted = stockAdjT
+          .filter((x) => x.targetType === targetType && x.targetKey === heldKey)
+          .reduce((s, x) => s + x.delta, 0)
+        const expected = item.stock - consumed + adjusted
+        const diff = expected - item.remain
+        // 当日消耗/回补（展示用）：有效消耗按业务日，撤销回补按审核日，售后退回/补发按售后审核日
+        const dayConsumed = recordsT.filter(
+          (r) => isPrize
+            ? (r.type === 'draw' && r.activityId === activityId && r.prizeId === id)
+            : (r.type === 'redeem' && r.goodsId === id)
+        ).filter((r) => {
+          if (r.status === 'revoked') return this._reviewDate(this._orderOfRecord(r.id)) === date
+          return r.date === date
+        }).reduce((n, r) => n + (r.status === 'revoked' ? -1 : 1), 0)
+        const dayAfterSale = doneAfterSales
+          .filter((a) => a.targetType === targetType && a.targetId === id &&
+            (targetType !== 'prize' || a.activityId === activityId) &&
+            (a.reviewedAt || '').slice(0, 10) === date)
+          .reduce((n, a) => n + (a.type === 'reship' ? 1 : -1), 0)
+        if (diff !== 0 || dayConsumed !== 0 || dayAfterSale !== 0) {
+          stockItems.push({
+            key: `stock-${heldKey}`, targetType, activityId, targetId: id, targetKey: heldKey,
+            name, icon,
+            stock: item.stock, consumed, adjusted, expected, actual: item.remain,
+            diff, dayConsumed: dayConsumed + dayAfterSale,
+            asReturned: asFix.returned, asReshipped: asFix.reshipped,
+            frozenHeld: heldByTarget.get(heldKey) || 0, frozenBook: item.frozen || 0,
+            autoFixable: diff !== 0
+          })
+        }
+      }
+      actsT.forEach((a) => a.prizes.forEach((p) => {
+        if (p.rarity !== 'none') pushStock('prize', a.id, p.id, `${a.name} / ${p.name}`, p.emoji, p)
+      }))
+      goodsT.forEach((g) => pushStock('goods', null, g.id, g.name, g.icon, g))
+
+      // —— P6 卡券账户勾稽（按业务日发券 + 当前态） ——
+      // 1) 有效券业务记录（normal/released 且 couponId）当日必须有券实例；撤销/冻结不得有券（漏发可补券）
+      // 2) 券实例必须能回指一条有效业务记录（孤立券人工核查，不自动作废）
+      // 3) 券码在租户内唯一（不同租户前缀业务隔离，重复码仅按租户内比对）
+      // 4) 已核销券必须有核销人/核销时间；已过期但仍可用的券为到期未流转（可自动修复）
+      const couponItems = []
+      // 1) 漏发：按业务记录
+      recordsT
+        .filter((r) => r.couponId && (r.status === 'normal' || r.status === 'released') &&
+          (r.status === 'released' ? this._reviewDate(this._orderOfRecord(r.id)) === date : r.date === date))
+        .forEach((r) => {
+          const c = couponsT.find((x) => x.recordId === r.id)
+          if (!c) {
+            couponItems.push({
+              key: `cp-missing-${r.id}`, kind: 'missing', recordId: r.id,
+              target: r.type === 'draw' ? r.prizeName : r.goodsName,
+              tplId: r.couponId, bizType: r.type,
+              expect: '有效业务记录应发券', actual: '券账户无实例', autoFixable: true
+            })
+          }
+        })
+      // 2) 孤立券 / 3) 重复码 / 4) 核销信息缺失、到期未流转（当前态，仅计入当日单避免每日重复列示）
+      if (date === this.todayDate) {
+        couponsT.forEach((c) => {
+          const rec = recordsT.find((r) => r.id === c.recordId)
+          if (!rec || rec.status === 'revoked' || rec.status === 'frozen') {
+            couponItems.push({
+              key: `cp-orphan-${c.id}`, kind: 'orphan', couponId: c.id, code: c.code,
+              target: c.name, expect: '券应回指有效业务记录',
+              actual: !rec ? '业务记录缺失' : `业务记录状态 ${rec.status}`, autoFixable: false
+            })
+          }
+          if (c.status === 'redeemed' && (!c.redeemedAt || !c.redeemOperator)) {
+            couponItems.push({
+              key: `cp-redeem-${c.id}`, kind: 'redeem-info', couponId: c.id, code: c.code,
+              target: c.name, expect: '已核销应有核销人/时间', actual: '核销信息不完整', autoFixable: false
+            })
+          }
+        })
+        const codeMap = new Map()
+        couponsT.forEach((c) => {
+          const k = this._normCode(c.code)
+          if (!codeMap.has(k)) codeMap.set(k, [])
+          codeMap.get(k).push(c)
+        })
+        codeMap.forEach((list, k) => {
+          if (k && list.length > 1) {
+            couponItems.push({
+              key: `cp-dup-${k}`, kind: 'duplicate', code: k, target: list[0].name,
+              expect: '租户内券码唯一', actual: `${list.length} 张券同码`, autoFixable: false
+            })
+          }
+        })
+        // 到期未流转：券状态仍 available 但已过到期时刻（正常应由 sweepCouponExpiry 自动处理）
+        const now = Date.now()
+        couponsT.filter((c) => c.status === 'available' && c.expireTs < now).forEach((c) => {
+          couponItems.push({
+            key: `cp-expire-${c.id}`, kind: 'expired-pending', couponId: c.id, code: c.code,
+            target: c.name, expect: `已于 ${c.expireDate} 到期`, actual: '账户仍标记待核销', autoFixable: true
+          })
+        })
+      }
+
+      const taskOpen = taskItems.length
+      const stockOpen = stockItems.filter((x) => x.diff !== 0).length
+      const couponOpen = couponItems.length
+      const openCount = (pointsResidual !== 0 ? 1 : 0) + taskOpen + (chainItem ? 1 : 0) +
+        frozenItems.length + stockOpen + couponOpen
+
+      return {
+        date,
+        tenantId: tid,
+        generatedAt: Date.now(),
+        points: { expectedNet, ledgerNet, compNet, residual: pointsResidual, autoFixable: pointsResidual > 0, detail: expectedDetail },
+        tasks: taskItems,
+        chain: chainItem,
+        frozen: frozenItems,
+        stock: stockItems,
+        coupons: couponItems,
+        openCount
+      }
+    },
+
+    // 差异指纹（残差/缺笔/不一致项完全相同即同一版本，重复执行幂等）
+    _reconSignature(d) {
+      return JSON.stringify({
+        p: d.points.residual,
+        t: d.tasks.map((x) => x.claimId).sort(),
+        c: d.chain ? 1 : 0,
+        f: d.frozen.map((x) => `${x.key}:${x.expect}/${x.actual}`),
+        s: d.stock.filter((x) => x.diff !== 0).map((x) => `${x.targetType}:${x.targetId}:${x.diff}`),
+        cp: (d.coupons || []).map((x) => `${x.key}`).sort()
+      })
+    },
+
+    // 执行对账（一租户一业务日一张单；历史日不触发业务日切换/兜底结算）
+    runRecon(date, silent = false, tenantId = this.activeTenantId) {
+      if ((date === this.todayDate || !date) && tenantId === this.activeTenantId) this.syncBusinessDay()
+      const d = date || this.todayDate
+      const tid = tenantId
+      const trace = this.beginTrace()
+      const diffs = this.computeReconDiffs(d, tid)
+      const signature = this._reconSignature(diffs)
+      let bill = this.reconBills.find((b) => b.date === d && (b.tenantId || 't-star') === tid)
+      const runAt = { at: `${this.todayDate} ${nowTime()}`, ts: Date.now(),
+        operator: this.actorName(),
+        openCount: diffs.openCount, balanced: diffs.openCount === 0 }
+
+      if (!bill) {
+        bill = {
+          id: genId('rc'), date: d, tenantId: tid,
+          status: diffs.openCount === 0 ? 'balanced' : 'pending',
+          signature, diffs,
+          runs: [runAt], compensations: [],
+          firstAt: runAt.at, reviewedAt: '', reviewer: '', reviewNote: '',
+          createdAt: this.todayDate
+        }
+        this.reconBills.unshift(bill)
+      } else {
+        const sameVersion = bill.signature === signature
+        bill.diffs = diffs
+        bill.signature = signature
+        bill.runs.unshift(runAt)
+        if (bill.runs.length > 50) bill.runs.pop()
+        if (!sameVersion) {
+          // 业务有变化导致残差改变：已平→待复核；曾经的复核/补偿结论保留在 reviewedAt/compensations
+          if (diffs.openCount === 0) bill.status = bill.compensations.length ? 'compensated' : 'balanced'
+          else bill.status = 'pending'
+        }
+        // 同版本但当前已平：已补偿单保持"已补偿平账"（重复执行幂等，不回退状态）
+        if (sameVersion && diffs.openCount === 0 && bill.compensations.length && bill.status !== 'compensated') {
+          bill.status = 'compensated'
+        }
+      }
+
+      this.addAuditLog('recon-run', bill.id,
+        diffs.openCount === 0
+          ? `【${this.tenants.find((t) => t.id === tid)?.shortName || tid}】业务日 ${d} 对账完成：账实相符，无差异（积分应有净额 ${diffs.points.expectedNet}，流水净额 ${diffs.points.ledgerNet}）`
+          : `【${this.tenants.find((t) => t.id === tid)?.shortName || tid}】业务日 ${d} 对账完成：发现 ${diffs.openCount} 项未平差异（积分残差 ${diffs.points.residual}、任务缺记 ${diffs.tasks.length} 笔、库存 ${diffs.stock.filter((x) => x.diff).length} SKU、卡券 ${diffs.coupons.length} 项、冻结 ${diffs.frozen.length} 项${diffs.chain ? '、余额链断裂' : ''}）`,
+        { module: 'recon', tenantId: tid, traceId: trace })
+      if (!silent) {
+        if (diffs.openCount === 0) this.showToast(`🧮 ${d} 对账完成：账实相符`, 'success')
+        else this.showToast(`🧮 ${d} 对账完成：${diffs.openCount} 项差异待运营复核`, 'warn')
+        this.endTrace()
+      }
+      return bill
+    },
+
+    // 运营复核差异单（RBAC：recon:review；仅本租户；不改动任何账目）
+    reviewRecon(date, note = '', tenantId = this.activeTenantId) {
+      const tid = tenantId
+      const trace = this.beginTrace()
+      if (!this.requirePerm('recon:review', 'recon') || !this.requireSameTenant(tid, 'recon')) {
+        this.endTrace()
+        return false
+      }
+      const bill = this.reconBills.find((b) => b.date === date && (b.tenantId || 't-star') === tid)
+      if (!bill) { this.showToast('请先执行对账', 'warn'); this.endTrace(); return false }
+      if (bill.diffs.openCount === 0) { this.showToast('该业务日账实相符，无需复核', 'info'); this.endTrace(); return false }
+      bill.status = 'reviewed'
+      bill.reviewedAt = `${this.todayDate} ${nowTime()}`
+      bill.reviewer = this.user.name
+      bill.reviewNote = note.trim()
+      this.addAuditLog('recon-review', bill.id,
+        `复核业务日 ${date} 的对账差异：${note.trim() || '确认差异属实，待补偿修正'}（原始记录保留，仅允许追加补偿流水）`,
+        { module: 'recon', tenantId: tid, traceId: trace })
+      this.showToast(`已复核 ${date} 差异单，可执行补偿修正`, 'success')
+      this.endTrace()
+      return true
+    },
+
+    // 复核通过后补偿：只追加补偿流水/库存校正，同步余额、库存；重复执行对已平项幂等跳过（RBAC：recon:compensate）
+    compensateRecon(date, note = '', tenantId = this.activeTenantId) {
+      const tid = tenantId
+      const trace = this.beginTrace()
+      if (!this.requirePerm('recon:compensate', 'recon') || !this.requireSameTenant(tid, 'recon')) {
+        this.endTrace()
+        return null
+      }
+      const bill0 = this.reconBills.find((b) => b.date === date && (b.tenantId || 't-star') === tid)
+      if (!bill0 || bill0.status === 'pending') { this.showToast('请先完成差异复核，再执行补偿', 'warn'); this.endTrace(); return null }
+      if (bill0.status === 'balanced' && !bill0.diffs.openCount) { this.showToast('该业务日账实相符，无需补偿', 'info'); this.endTrace(); return null }
+      // 以最新账实重新推导（防止复核后业务又有变化导致错补）
+      const live = this.computeReconDiffs(date, tid)
+      const actions = []
+
+      // 1) 任务奖励逐笔补记（余额与流水同步追加，保留原始记录）
+      live.tasks.forEach((item) => {
+        const claim = this.taskClaims.find((c) => c.id === item.claimId)
+        if (!claim || this._taskClaimFlow(claim, new Set(), tid)) return // 台账→流水统一判重
+        this.points += item.reward
+        const cross = item.grantDate !== item.bizDate ? `（归属 ${item.bizDate} 跨日补计）` : ''
+        this.addPointRecord(item.reward, `对账补偿：任务奖励补记【${item.label}】${cross}`, 'task-comp', {
+          bizDate: item.bizDate, refId: item.claimId, refType: 'task-claim', tenantId: tid, traceId: trace
+        })
+        actions.push({ type: 'task', label: item.label, delta: item.reward })
+      })
+
+      // 2) 积分净额残差（>0 业务真实、流水少记 → 补流水并同步余额；<0 为长款/多记，需人工核查不自动扣减）
+      const live2 = this.computeReconDiffs(date, tid)
+      const pr = live2.points.residual
+      if (pr > 0) {
+        this.points += pr
+        this.addPointRecord(pr, `对账补偿：${date} 积分净额差异（业务流水少记，按差异单补记）`, 'recon-comp', {
+          bizDate: date, refId: bill0.id, refType: 'recon-bill', tenantId: tid, traceId: trace
+        })
+        actions.push({ type: 'points', label: '积分净额残差', delta: pr })
+      }
+      const manualPoints = pr < 0 ? Math.abs(pr) : 0
+
+      // 3) 库存校正：账实差异以调整凭证把"账面应有"对齐实物（盘亏记 -1、盘盈记 +1），
+      //    不凭空回补/扣减实物；追加 append-only 库存校正台账
+      live2.stock.filter((x) => x.diff !== 0).forEach((x) => {
+        const target = x.targetType === 'prize'
+          ? this.activities.find((a) => a.id === x.activityId)?.prizes.find((p) => p.id === x.targetId)
+          : this.goods.find((g) => g.id === x.targetId)
+        if (!target) return
+        const before = target.remain
+        // 注入一笔 -diff 的账存调整凭证：expected = stock - consumed + adjusted = actual
+        this.stockAdjustments.unshift({
+          id: genId('sa'), billId: bill0.id, bizDate: date,
+          tenantId: tid, traceId: trace,
+          date: this.todayDate, time: nowTime(), ts: Date.now(),
+          targetType: x.targetType, targetId: x.targetId, targetKey: x.targetKey,
+          activityId: x.activityId || null, targetName: x.name,
+          delta: -x.diff, before, after: before,
+          reason: note.trim() || (x.diff > 0
+            ? '对账差异补偿：实物盘亏，按差异单登记库存调整（账面核销）'
+            : '对账差异补偿：实物盘盈，按差异单登记库存调整（账面补登）'),
+          operator: this.user.name
+        })
+        actions.push({ type: 'stock', label: x.name, delta: -x.diff })
+      })
+
+      // 4) 卡券账户补偿（P6）：
+      //    漏发券：按有效业务记录补发新券（新券码、有效期自补券日起算，append-only 不伪造历史），按 recordId 幂等；
+      //    到期未流转：执行到期扫描置为 expired；
+      //    孤立券/重复码/核销信息缺失：人工核查，不自动作废、不改写。
+      let couponIssued = 0
+      let couponExpiredFixed = 0
+      let couponManual = 0
+      live2.coupons.forEach((x) => {
+        if (x.kind === 'missing') {
+          const rec = this.records.find((r) => r.id === x.recordId)
+          if (!rec || this.coupons.some((c) => c.recordId === rec.id)) return
+          const c = this.issueCouponForRecord(rec, { source: '对账补券', compensateBillId: bill0.id })
+          if (c) {
+            // 补券台账标记为 comp（issueCouponForRecord 默认按来源写 issue/deliver，这里补一条补偿凭证勾稽差异单）
+            this.addCouponLog('comp', c.id, rec, { code: c.code, note: `按 ${date} 差异单补发，有效期自补券日起算`, tenantId: tid, traceId: trace })
+            this.addAuditLog('coupon-comp', bill0.id,
+              `对账补偿：业务记录【${x.target}】券账户漏发，补发新券 ${c.code}（有效期至 ${c.expireDate}，原始记录保留）`,
+              { module: 'recon', tenantId: tid, traceId: trace })
+            actions.push({ type: 'coupon', label: x.target, delta: 1, code: c.code })
+            couponIssued += 1
+          }
+        } else if (x.kind === 'expired-pending') {
+          const c = this.coupons.find((y) => y.id === x.couponId)
+          if (c && c.status === 'available' && c.expireTs < Date.now()) {
+            c.status = 'expired'
+            const rec = this.records.find((r) => r.id === c.recordId) || null
+            this.addCouponLog('expire', c.id, rec, { code: c.code, note: `按 ${date} 差异单补做到期流转`, tenantId: tid, traceId: trace })
+            actions.push({ type: 'coupon-expire', label: x.target, delta: 0, code: c.code })
+            couponExpiredFixed += 1
+          }
+        } else {
+          couponManual += 1
+        }
+      })
+
+      if (!actions.length && !manualPoints && !couponManual && !live2.chain && !live2.frozen.length) {
+        this.showToast('账目已平，无需重复补偿', 'info')
+        this.endTrace()
+        return null
+      }
+
+      const pointDelta = actions.filter((a) => a.type !== 'stock' && a.type !== 'coupon' && a.type !== 'coupon-expire')
+        .reduce((s, a) => s + a.delta, 0)
+      const stockCount = actions.filter((a) => a.type === 'stock').length
+      const couponCount = couponIssued
+      if (actions.length) {
+        bill0.compensations.unshift({
+          id: genId('rcc'), at: `${this.todayDate} ${nowTime()}`,
+          pointDelta, stockCount, couponCount, note: note.trim(), reviewer: this.user.name,
+          items: actions.map((a) => ({ ...a }))
+        })
+      }
+      this.addAuditLog('recon-comp', bill0.id,
+        `补偿业务日 ${date} 差异：` +
+        actions.map((a) => {
+          if (a.type === 'stock') return `库存【${a.label}】校正 ${a.delta > 0 ? '+' : ''}${a.delta}`
+          if (a.type === 'coupon') return `卡券【${a.label}】补发新券 ${a.code}`
+          if (a.type === 'coupon-expire') return `卡券【${a.label}】补做到期失效`
+          return `【${a.label}】补记 +${a.delta} 积分`
+        }).join('；') +
+        (manualPoints ? `；另有积分长款 ${manualPoints}（流水多记/来源不明），已标记需人工核查，未自动扣减` : '') +
+        (couponManual ? `；另有 ${couponManual} 项卡券异常（孤立券/重复码/核销信息缺失）需人工核查，未自动处理` : '') +
+        (live2.frozen.length ? `；${live2.frozen.length} 项冻结单据不一致需在风控申诉中处理` : '') +
+        (note.trim() ? `；备注：${note.trim()}` : '') + '；原始记录保留未改写',
+        { module: 'recon', tenantId: tid, traceId: trace })
+
+      // 重新对账刷新差异单（补偿流水/校正参与勾稽；P3 余额链随余额同步自愈）
+      const refreshed = this.runRecon(date, true, tid)
+      if (refreshed.diffs.openCount === 0) bill0.status = 'compensated'
+      else bill0.status = 'reviewed' // 仍有长款/冻结类等需人工处理的差异
+
+      const parts = []
+      if (pointDelta) parts.push(`补记积分 +${pointDelta}`)
+      if (stockCount) parts.push(`校正 ${stockCount} 项库存`)
+      if (couponCount) parts.push(`补发 ${couponCount} 张卡券`)
+      if (couponExpiredFixed) parts.push(`${couponExpiredFixed} 张卡券补做到期`)
+      this.showToast(parts.length ? `🧮 补偿完成：${parts.join('，')}，余额/库存/卡券已同步` : '🧮 补偿已记录，剩余差异需人工处理',
+        refreshed.diffs.openCount === 0 ? 'success' : 'warn')
+      this.endTrace()
+      return { pointDelta, stockCount, couponCount, couponExpiredFixed, manualPoints, couponManual, actions }
+    },
+
+    // ===== 演示用：注入账实差异（模拟漏记/盘亏，便于观察对账→复核→补偿闭环） =====
+    // 仅制造"业务凭证存在、账目少记/实物缺失"，原始业务与库存规则保持完整，对账应能逐项检出
+    injectTaskFlowGap() {
+      // 模拟：一笔任务领奖台账已落、积分与流水却漏记（余额未加）→ P1 净额 + P2 台账缺笔
+      this.syncBusinessDay()
+      const d = this.todayDate
+      const tid = this.activeTenantId
+      const marker = `inject-gap-${tid}-${d}`
+      if (this.taskClaims.some((c) => c.id === marker)) {
+        this.showToast('今日已注入过漏记差异，请勿重复注入', 'warn')
+        return
+      }
+      this.taskClaims.push({
+        id: marker, taskId: 't-checkin', taskLabel: '每日签到（漏记演示）', reward: 30,
+        tenantId: tid,
+        bizDate: d, grantDate: d, time: nowTime(), ts: Date.now(), source: 'manual-gap'
+      })
+      this.addAuditLog('recon-inject', null,
+        `【演示注入】${d} 一笔 30 积分任务奖励台账已落但积分与流水漏记，等待对账检出`,
+        { module: 'recon', tenantId: tid })
+      this.showToast('🔧 已注入演示差异：30 积分任务奖励漏记（台账在、账目少）', 'warn')
+    },
+    injectStockLoss() {
+      // 模拟：商品实物盘亏 1 件（实物 remain 少 1，业务消耗记录不变）
+      this.syncBusinessDay()
+      const tid = this.activeTenantId
+      const g = this.goods.find((x) => x.id === 'g1' && (x.tenantId || 't-star') === tid)
+      if (!g || g.remain <= 0) { this.showToast('当前租户 g1 库存不足，无法注入盘亏', 'warn'); return }
+      g.remain -= 1
+      const d = this.todayDate
+      this.addAuditLog('recon-inject', null,
+        `【演示注入】${d} 商品【${g.name}】实物盘亏 1 件（业务记录完整、实物账少 1），等待对账检出`,
+        { module: 'recon', tenantId: tid })
+      this.showToast('🔧 已注入演示差异：满50减10优惠券盘亏 1 件', 'warn')
+    },
+
+    // ===== 活动运营管理（RBAC：activity:manage；仅本租户活动） =====
+    toggleActivityStatus(id) {
+      const trace = this.beginTrace()
+      const a = this.activities.find((x) => x.id === id)
+      if (!a) { this.endTrace(); return }
+      if (!this.requirePerm('activity:manage', 'activity') || !this.requireSameTenant(a.tenantId, 'activity')) {
+        this.endTrace(); return
+      }
+      const map = { running: 'paused', paused: 'running', ended: 'running' }
+      a.status = map[a.status]
+      this.addAuditLog('activity-toggle', a.id,
+        `活动【${a.name}】状态变更为${a.status === 'running' ? '运行中' : a.status === 'paused' ? '已暂停' : '已结束'}`,
+        { module: 'activity', tenantId: a.tenantId, traceId: trace })
+      this.showToast(`活动【${a.name}】已${a.status === 'running' ? '恢复/启动' : a.status === 'paused' ? '暂停' : '结束'}`, 'info')
+      this.endTrace()
+    },
+    resetActivityStock(id) {
+      const trace = this.beginTrace()
+      const a = this.activities.find((x) => x.id === id)
+      if (!a) { this.endTrace(); return }
+      if (!this.requirePerm('activity:manage', 'activity') || !this.requireSameTenant(a.tenantId, 'activity')) {
+        this.endTrace(); return
+      }
+      // 重置时不动审核中预占的库存：remain 恢复为 总库存 - 冻结预占
+      a.prizes.forEach((p) => { p.remain = p.stock - (p.frozen || 0) })
+      this.addAuditLog('activity-stock-reset', a.id, `活动【${a.name}】奖品库存重置（风控预占保留）`,
+        { module: 'activity', tenantId: a.tenantId, traceId: trace })
+      this.showToast(`活动【${a.name}】奖品库存已恢复（风控预占保留）`, 'success')
+      this.endTrace()
+    },
+    deleteActivity(id) {
+      const trace = this.beginTrace()
+      const a = this.activities.find((x) => x.id === id)
+      if (!a) { this.endTrace(); return false }
+      if (!this.requirePerm('activity:manage', 'activity') || !this.requireSameTenant(a.tenantId, 'activity')) {
+        this.endTrace(); return false
+      }
+      this.activities = this.activities.filter((x) => x.id !== id)
+      this.addAuditLog('activity-delete', id, `删除活动【${a.name}】（配置删除，历史业务记录保留）`,
+        { module: 'activity', tenantId: a.tenantId, traceId: trace })
+      this.showToast(`活动【${a.name}】已删除`, 'info')
+      this.endTrace()
+      return true
+    },
+    createActivity(payload) {
+      const trace = this.beginTrace()
+      if (!this.requirePerm('activity:manage', 'activity')) { this.endTrace(); return null }
+      const tid = this.activeTenantId
+      const id = 'act-' + Date.now().toString().slice(-5)
+      const act = {
+        id,
+        tenantId: tid,
+        name: payload.name,
+        type: payload.type,
+        status: 'running',
+        cost: payload.cost || 0,
+        costType: payload.costType || 'free',
+        dailyLimit: payload.dailyLimit || 3,
+        totalLimit: payload.totalLimit || 50,
+        icon: '🎪',
+        desc: payload.desc || '新活动',
+        startAt: payload.startAt || this.todayDate,
+        endAt: payload.endAt || this.todayDate,
+        prizes: (payload.prizes || []).map((p, i) => ({
+          id: 'p' + i + '-' + id,
+          name: p.name,
+          rarity: p.rarity || 'common',
+          stock: p.stock || 10,
+          remain: p.stock || 10,
+          frozen: 0,
+          weight: p.weight || 10,
+          // 实物/虚拟：显式指定优先，兜底按奖品名（含"积分"视为虚拟积分奖品）
+          physical: p.physical !== undefined ? !!p.physical : !p.name.includes('积分'),
+          emoji: p.emoji || '🎁'
+        }))
+      }
+      // 确保含"谢谢参与"
+      if (!act.prizes.some((p) => p.rarity === 'none')) {
+        act.prizes.push({ id: 'p-none-' + id, name: '谢谢参与', rarity: 'none', stock: 99999, remain: 99999, frozen: 0, weight: 100, emoji: '🤝' })
+      }
+      this.activities.unshift(act)
+      this.addAuditLog('activity-create', act.id,
+        `【${this.activeTenant.shortName}】新建活动【${act.name}】（${payload.type === 'wheel' ? '幸运转盘' : '刮刮乐'}，${act.prizes.length} 个奖品）`,
+        { module: 'activity', tenantId: tid, traceId: trace })
+      this.showToast(`活动【${act.name}】创建成功`, 'success')
+      this.endTrace()
+      return act
+    },
+
+    // ===== 组织成员管理（RBAC：org:member；仅本租户） =====
+    createMember(form) {
+      const trace = this.beginTrace()
+      if (!this.requirePerm('org:member', 'org')) { this.endTrace(); return null }
+      const tid = form.tenantId || this.activeTenantId
+      if (!this.requireSameTenant(tid, 'org')) { this.endTrace(); return null }
+      const name = (form.name || '').trim()
+      if (!name) { this.showToast('请填写成员姓名', 'warn'); this.endTrace(); return null }
+      if (!this.roleOfKey(form.roleKey)) { this.showToast('请选择有效角色', 'warn'); this.endTrace(); return null }
+      const member = {
+        id: genId('m'),
+        tenantId: tid,
+        name,
+        avatar: form.avatar || '🧑‍💼',
+        roleKey: form.roleKey,
+        status: 'active',
+        phone: (form.phone || '').trim(),
+        email: (form.email || '').trim(),
+        ip: `10.${10 + Math.floor(Math.random() * 240)}.${Math.floor(Math.random() * 250)}.${1 + Math.floor(Math.random() * 250)}`,
+        joinedAt: this.todayDate,
+        lastLoginAt: ''
+      }
+      this.members.push(member)
+      this.addAuditLog('member-create', member.id,
+        `新增成员【${name}】角色「${this.roleLabelOf(form.roleKey)}」归属 ${this.tenants.find((t) => t.id === tid)?.shortName || tid}`,
+        { module: 'org', tenantId: tid, traceId: trace })
+      this.showToast(`成员【${name}】已创建`, 'success')
+      this.endTrace()
+      return member
+    },
+    updateMember(memberId, patch) {
+      const trace = this.beginTrace()
+      const m = this.members.find((x) => x.id === memberId)
+      if (!m) { this.endTrace(); return false }
+      if (!this.requirePerm('org:member', 'org') || !this.requireSameTenant(m.tenantId, 'org')) {
+        this.endTrace(); return false
+      }
+      const before = { name: m.name, avatar: m.avatar, phone: m.phone, email: m.email }
+      Object.assign(m, patch)
+      const changes = Object.keys(patch).filter((k) => String(before[k] || '') !== String(patch[k] || ''))
+      this.addAuditLog('member-update', m.id,
+        `编辑成员【${m.name}】资料：${changes.map((k) => `${k}=${patch[k]}`).join('，') || '无变化'}`,
+        { module: 'org', tenantId: m.tenantId, traceId: trace })
+      this.showToast(`成员【${m.name}】资料已更新`, 'success')
+      this.endTrace()
+      return true
+    },
+    // 成员调岗（角色变更单独留痕，便于权限审计）
+    assignMemberRole(memberId, roleKey) {
+      const trace = this.beginTrace()
+      const m = this.members.find((x) => x.id === memberId)
+      if (!m) { this.endTrace(); return false }
+      if (!this.requirePerm('org:member', 'org') || !this.requireSameTenant(m.tenantId, 'org')) {
+        this.endTrace(); return false
+      }
+      if (!this.roleOfKey(roleKey) || roleKey === 'platform_admin') {
+        this.showToast('角色无效或不可分配', 'warn'); this.endTrace(); return false
+      }
+      const from = this.roleLabelOf(m.roleKey)
+      m.roleKey = roleKey
+      this.addAuditLog('member-role', m.id,
+        `成员【${m.name}】调岗：${from} → ${this.roleLabelOf(roleKey)}`,
+        { module: 'org', tenantId: m.tenantId, traceId: trace })
+      this.showToast(`【${m.name}】已调岗为「${this.roleLabelOf(roleKey)}」`, 'success')
+      this.endTrace()
+      return true
+    },
+    // 停用 / 启用成员（停用后登录与所有操作被拒绝并留痕；不允许停用自己）
+    toggleMember(memberId, reason = '') {
+      const trace = this.beginTrace()
+      const m = this.members.find((x) => x.id === memberId)
+      if (!m) { this.endTrace(); return false }
+      if (!this.requirePerm('org:member', 'org') || !this.requireSameTenant(m.tenantId, 'org')) {
+        this.endTrace(); return false
+      }
+      if (m.id === this.currentMemberId) {
+        this.showToast('不能停用当前登录账号', 'warn'); this.endTrace(); return false
+      }
+      const toDisable = m.status === 'active'
+      m.status = toDisable ? 'disabled' : 'active'
+      if (toDisable) m.disabledReason = reason.trim() || '管理员手动停用'
+      else m.disabledReason = ''
+      this.addAuditLog('member-toggle', m.id,
+        `${toDisable ? '停用' : '启用'}成员【${m.name}】${toDisable && reason.trim() ? '；原因：' + reason.trim() : ''}`,
+        { module: 'org', tenantId: m.tenantId, traceId: trace, result: toDisable ? 'denied' : 'success' })
+      this.showToast(`成员【${m.name}】已${toDisable ? '停用' : '启用'}`, toDisable ? 'warn' : 'success')
+      this.endTrace()
+      return true
+    },
+
+    // ===== 自定义角色（RBAC：org:role；仅本租户；内置角色不可改/删） =====
+    createRole(form) {
+      const trace = this.beginTrace()
+      if (!this.requirePerm('org:role', 'org')) { this.endTrace(); return null }
+      const tid = this.activeTenantId
+      const name = (form.name || '').trim()
+      if (!name) { this.showToast('请填写角色名称', 'warn'); this.endTrace(); return null }
+      const role = {
+        id: genId('cr'),
+        tenantId: tid,
+        key: 'cr_' + Date.now().toString(36),
+        name,
+        icon: form.icon || '🛠️',
+        builtin: false,
+        desc: (form.desc || '').trim() || '租户自定义角色',
+        permissions: [...new Set(form.permissions || [])].filter((p) => p !== 'tenant:manage')
+      }
+      this.customRoles.push(role)
+      this.addAuditLog('role-create', role.id,
+        `【${this.activeTenant.shortName}】新建自定义角色【${name}】，权限 ${role.permissions.length} 项：${role.permissions.map((p) => PERMISSION_LABELS[p] || p).join('、') || '（空权限）'}`,
+        { module: 'org', tenantId: tid, traceId: trace })
+      this.showToast(`角色【${name}】已创建`, 'success')
+      this.endTrace()
+      return role
+    },
+    updateRolePermissions(roleId, permissions) {
+      const trace = this.beginTrace()
+      const role = this.customRoles.find((r) => r.id === roleId)
+      if (!role) { this.endTrace(); return false }
+      if (!this.requirePerm('org:role', 'org') || !this.requireSameTenant(role.tenantId, 'org')) {
+        this.endTrace(); return false
+      }
+      const before = new Set(role.permissions)
+      const next = [...new Set(permissions || [])].filter((p) => p !== 'tenant:manage')
+      const added = next.filter((p) => !before.has(p))
+      const removed = [...before].filter((p) => !next.includes(p))
+      role.permissions = next
+      this.addAuditLog('role-update', role.id,
+        `角色【${role.name}】权限变更：新增 ${added.map((p) => PERMISSION_LABELS[p] || p).join('、') || '无'}；移除 ${removed.map((p) => PERMISSION_LABELS[p] || p).join('、') || '无'}`,
+        { module: 'org', tenantId: role.tenantId, traceId: trace })
+      this.showToast(`角色【${role.name}】权限已更新（即时生效）`, 'success')
+      this.endTrace()
+      return true
+    },
+    deleteRole(roleId) {
+      const trace = this.beginTrace()
+      const role = this.customRoles.find((r) => r.id === roleId)
+      if (!role) { this.endTrace(); return false }
+      if (!this.requirePerm('org:role', 'org') || !this.requireSameTenant(role.tenantId, 'org')) {
+        this.endTrace(); return false
+      }
+      const inUse = this.members.some((m) => m.roleKey === role.key)
+      if (inUse) { this.showToast(`角色【${role.name}】仍有成员使用，请先调岗`, 'warn'); this.endTrace(); return false }
+      this.customRoles = this.customRoles.filter((r) => r.id !== roleId)
+      this.addAuditLog('role-delete', roleId, `删除自定义角色【${role.name}】`,
+        { module: 'org', tenantId: role.tenantId, traceId: trace })
+      this.showToast(`角色【${role.name}】已删除`, 'info')
+      this.endTrace()
+      return true
+    },
+
+    // ===== 平台方：租户开通/停用/配置（RBAC：tenant:manage，仅平台超管） =====
+    createTenant(form) {
+      const trace = this.beginTrace()
+      if (!this.requirePerm('tenant:manage', 'platform')) { this.endTrace(); return null }
+      const name = (form.name || '').trim()
+      if (!name) { this.showToast('请填写组织名称', 'warn'); this.endTrace(); return null }
+      const id = 't-' + Date.now().toString(36)
+      const tenant = {
+        id,
+        name,
+        shortName: (form.shortName || '').trim() || name,
+        icon: form.icon || '🏢',
+        plan: form.plan || '标准版',
+        status: 'active',
+        contact: (form.contact || '').trim(),
+        phone: (form.phone || '').trim(),
+        region: (form.region || '').trim(),
+        createdAt: this.todayDate,
+        modules: ['抽奖活动', '积分中心', '风控申诉', '物流发货', '卡券核销', '积分库存对账'],
+        dataIsolation: '强隔离：数据按 tenantId 物理标记，仅本租户成员与平台方可访问',
+        remark: (form.remark || '').trim()
+      }
+      this.tenants.push(tenant)
+      // 新租户持有独立的默认风控规则副本（配置互不影响）
+      this.riskRulesByTenant[id] = makeDefaultRiskRules()
+      // 开通即创建组织管理员账号
+      const admin = {
+        id: genId('m'), tenantId: id, name: form.contact || tenant.shortName + '管理员', avatar: '👑',
+        roleKey: 'org_admin', status: 'active', phone: form.phone || '', email: '',
+        ip: '10.0.0.1', joinedAt: this.todayDate, lastLoginAt: ''
+      }
+      this.members.push(admin)
+      this.addAuditLog('tenant-create', id,
+        `平台开通租户【${tenant.shortName}】（${tenant.plan}），联系人 ${admin.name}，数据强隔离生效`,
+        { module: 'platform', tenantId: id, traceId: trace })
+      this.showToast(`租户【${tenant.shortName}】已开通`, 'success')
+      this.endTrace()
+      return tenant
+    },
+    toggleTenant(tenantId, reason = '') {
+      const trace = this.beginTrace()
+      if (!this.requirePerm('tenant:manage', 'platform')) { this.endTrace(); return false }
+      const t = this.tenants.find((x) => x.id === tenantId)
+      if (!t) { this.endTrace(); return false }
+      t.status = t.status === 'active' ? 'suspended' : 'active'
+      this.addAuditLog('tenant-toggle', t.id,
+        `平台${t.status === 'suspended' ? '停用' : '恢复启用'}租户【${t.shortName}】${reason.trim() ? '；原因：' + reason.trim() : ''}（停用后该租户成员登录被拒绝）`,
+        { module: 'platform', tenantId: t.id, traceId: trace, result: t.status === 'suspended' ? 'denied' : 'success' })
+      this.showToast(`租户【${t.shortName}】已${t.status === 'suspended' ? '停用' : '恢复启用'}`, t.status === 'suspended' ? 'warn' : 'success')
+      this.endTrace()
+      return true
+    },
+    updateTenant(tenantId, patch) {
+      const trace = this.beginTrace()
+      if (!this.requirePerm('tenant:manage', 'platform')) { this.endTrace(); return false }
+      const t = this.tenants.find((x) => x.id === tenantId)
+      if (!t) { this.endTrace(); return false }
+      Object.assign(t, patch)
+      this.addAuditLog('tenant-update', t.id, `租户【${t.shortName}】配置变更：${Object.keys(patch).join('、')}`,
+        { module: 'platform', tenantId: t.id, traceId: trace })
+      this.showToast(`租户【${t.shortName}】配置已更新`, 'success')
+      this.endTrace()
+      return true
+    },
+
+    // ===== 演示数据：预置审核单 / 冻结积分 / 预占库存 =====
+    seedRiskData() {
+      const uid = this.user.id
+      const uname = this.user.name
+      // —— 1) 待审核：传说大奖（10 积分成本 + 预占 iPhone） ——
+      const a1 = this.activities.find((a) => a.id === 'act-1')
+      const pLegend = a1?.prizes.find((p) => p.id === 'p1')
+      if (pLegend) { pLegend.remain -= 1; pLegend.frozen += 1 }
+      const rec1 = {
+        id: 'seed-r1', type: 'draw', status: 'frozen',
+        date: this.todayDate, time: '10:02:15', ts: todayAt(10, 2),
+        activityId: 'act-1', activityName: '周年庆幸运转盘',
+        prizeId: 'p1', prizeName: 'iPhone 16', rarity: 'legendary', icon: '📱',
+        riskOrderId: 'seed-rk1'
+      }
+      this.records.push(rec1)
+      this.riskOrders.push({
+        id: 'seed-rk1', bizType: 'draw', status: 'pending', userId: uid, userName: uname,
+        recordId: rec1.id, activityId: 'act-1', targetId: 'p1', targetName: 'iPhone 16',
+        icon: '📱', rarity: 'legendary', frozenPoints: 0, stockHeld: 1,
+        rules: [{ code: 'highValue', label: RULE_LABELS.highValue }],
+        appealReason: '', appealAt: '', reviewNote: '', reviewer: '',
+        createdAt: this.todayDate, time: '10:02:15', ts: todayAt(10, 2), reviewedAt: ''
+      })
+
+      // —— 2) 已申诉：刮刮乐史诗（10 积分成本冻结 + 预占视频月卡） ——
+      const a2 = this.activities.find((a) => a.id === 'act-2')
+      const pEpic = a2?.prizes.find((p) => p.id === 'p2')
+      if (pEpic) { pEpic.remain -= 1; pEpic.frozen += 1 }
+      this.points -= 10
+      const rec2 = {
+        id: 'seed-r2', type: 'draw', status: 'frozen',
+        date: this.todayDate, time: '09:40:08', ts: todayAt(9, 40),
+        activityId: 'act-2', activityName: '新人刮刮乐',
+        prizeId: 'p2', prizeName: '视频月卡', rarity: 'epic', couponId: 'c-video-month', icon: '🎬',
+        riskOrderId: 'seed-rk2'
+      }
+      this.records.push(rec2)
+      this.riskOrders.push({
+        id: 'seed-rk2', bizType: 'draw', status: 'appealed', userId: uid, userName: uname,
+        recordId: rec2.id, activityId: 'act-2', targetId: 'p2', targetName: '视频月卡',
+        icon: '🎬', rarity: 'epic', frozenPoints: 10, stockHeld: 1,
+        rules: [{ code: 'highValue', label: RULE_LABELS.highValue }],
+        appealReason: '本人正常参与活动中奖，未使用任何外挂，请求放行。',
+        appealAt: `${this.todayDate} 09:45:30`, reviewNote: '', reviewer: '',
+        createdAt: this.todayDate, time: '09:40:08', ts: todayAt(9, 40), reviewedAt: ''
+      })
+      this.pointRecords.unshift({
+        id: 'seed-pr2', date: this.todayDate, time: '09:40:08', ts: todayAt(9, 40),
+        delta: -10, balance: this.points, note: '冻结：参与【新人刮刮乐】待风控审核', kind: 'frozen'
+      })
+
+      // —— 3) 待审核：高价值兑换 盲盒福袋（200 积分冻结 + 预占 g4） ——
+      const g4 = this.goods.find((g) => g.id === 'g4')
+      if (g4) { g4.remain -= 1; g4.frozen += 1 }
+      this.points -= 200
+      const rec3 = {
+        id: 'seed-r3', type: 'redeem', status: 'frozen',
+        date: this.todayDate, time: '09:15:22', ts: todayAt(9, 15),
+        goodsId: 'g4', goodsName: '盲盒福袋', icon: '🎁', riskOrderId: 'seed-rk3'
+      }
+      this.records.push(rec3)
+      this.riskOrders.push({
+        id: 'seed-rk3', bizType: 'redeem', status: 'pending', userId: uid, userName: uname,
+        recordId: rec3.id, activityId: null, targetId: 'g4', targetName: '盲盒福袋',
+        icon: '🎁', rarity: null, frozenPoints: 200, stockHeld: 1,
+        rules: [{ code: 'highValue', label: RULE_LABELS.highValue },
+                { code: 'rapidRedeem', label: RULE_LABELS.rapidRedeem }],
+        appealReason: '', appealAt: '', reviewNote: '', reviewer: '',
+        createdAt: this.todayDate, time: '09:15:22', ts: todayAt(9, 15), reviewedAt: ''
+      })
+      this.pointRecords.unshift({
+        id: 'seed-pr3', date: this.todayDate, time: '09:15:22', ts: todayAt(9, 15),
+        delta: -200, balance: this.points, note: '冻结：兑换【盲盒福袋】待风控审核', kind: 'frozen'
+      })
+
+      // —— 4) 已放行：500元购物卡（免费转盘，无积分冻结，库存已核销） ——
+      const pEpicCard = a1?.prizes.find((p) => p.id === 'p2')
+      if (pEpicCard) { pEpicCard.remain -= 1 }
+      const rec4 = {
+        id: 'seed-r4', type: 'draw', status: 'released',
+        date: this.todayDate, time: '08:55:40', ts: todayAt(8, 55),
+        activityId: 'act-1', activityName: '周年庆幸运转盘',
+        prizeId: 'p2', prizeName: '500元购物卡', rarity: 'epic', icon: '💳',
+        riskOrderId: 'seed-rk4'
+      }
+      this.records.push(rec4)
+      this.riskOrders.push({
+        id: 'seed-rk4', bizType: 'draw', status: 'released', userId: uid, userName: uname,
+        recordId: rec4.id, activityId: 'act-1', targetId: 'p2', targetName: '500元购物卡',
+        icon: '💳', rarity: 'epic', frozenPoints: 0, stockHeld: 0,
+        rules: [{ code: 'highValue', label: RULE_LABELS.highValue }],
+        appealReason: '系统误判，正常中奖。', appealAt: `${this.todayDate} 09:00:00`,
+        reviewNote: '核实为正常用户，放行并发奖。', reviewer: '运营小张',
+        createdAt: this.todayDate, time: '08:55:40', ts: todayAt(8, 55),
+        reviewedAt: `${this.todayDate} 09:10:12`
+      })
+
+      // —— 5) 已撤销：视频会员周卡（80 积分冻结后返还 + 券库存预占后回补，业务记录保留为 revoked；券从未发出） ——
+      const rec5 = {
+        id: 'seed-r5', type: 'redeem', status: 'revoked',
+        date: this.todayDate, time: '08:30:05', ts: todayAt(8, 30),
+        goodsId: 'g2', goodsName: '视频会员周卡', couponId: 'c-video-week', icon: '🎬', riskOrderId: 'seed-rk5'
+      }
+      this.records.push(rec5)
+      this.riskOrders.push({
+        id: 'seed-rk5', bizType: 'redeem', status: 'revoked', userId: uid, userName: uname,
+        recordId: rec5.id, activityId: null, targetId: 'g2', targetName: '视频会员周卡',
+        icon: '🎬', rarity: null, frozenPoints: 80, stockHeld: 0,
+        rules: [{ code: 'rapidRedeem', label: RULE_LABELS.rapidRedeem }],
+        appealReason: '', appealAt: '',
+        reviewNote: '命中短时连续兑换规则，自动拦截，用户未申诉。', reviewer: '系统',
+        createdAt: this.todayDate, time: '08:30:05', ts: todayAt(8, 30),
+        reviewedAt: `${this.todayDate} 08:35:00`
+      })
+      // 撤销前的冻结成本（与正常 freezeRedeem 一致：先扣 80、预占库存），08:35 撤销时返还 80、回补库存
+      this.points -= 80
+      this.pointRecords.unshift({
+        id: 'seed-pr5f', date: this.todayDate, time: '08:30:05', ts: todayAt(8, 30) + 1,
+        delta: -80, balance: this.points, note: '冻结：兑换【视频会员周卡】待风控审核', kind: 'frozen'
+      })
+      this.points += 80
+      this.pointRecords.unshift({
+        id: 'seed-pr5', date: this.todayDate, time: '08:35:00', ts: todayAt(8, 35),
+        delta: 80, balance: this.points, note: '撤销返还：兑换【视频会员周卡】', kind: 'refund'
+      })
+
+      // —— 6) 历史业务日台账：演示"按业务日保留进度与领奖记录 + 跨日审核补计" ——
+      const DAY = 86400000
+      const d1 = dateStr(-1)   // 上一业务日
+      const d2 = dateStr(-2)   // 前两业务日
+      // 前两业务日：3 次有效参与（谢谢参与，无库存/积分变动）→ 当日任务已自动结算 +15
+      ;[['08:10:02', 8, 10], ['08:11:15', 8, 11], ['08:12:40', 8, 12]].forEach(([time, h, m], i) => {
+        this.records.push({
+          id: `seed-rd2-${i}`, type: 'draw', status: 'normal',
+          date: d2, time, ts: todayAt(h, m) - 2 * DAY,
+          activityId: 'act-1', activityName: '周年庆幸运转盘',
+          prizeId: 'p6', prizeName: '谢谢参与', rarity: 'none', icon: '🤝'
+        })
+      })
+      this.taskClaims.push({
+        id: 'seed-tc1', taskId: 't-draw3', taskLabel: '今日抽奖3次', reward: 15,
+        bizDate: d2, grantDate: d2, time: '08:12:40', ts: todayAt(8, 12) - 2 * DAY, source: 'auto',
+        flowId: 'seed-pr1'
+      })
+      this.pointRecords.unshift({
+        id: 'seed-pr1', date: d2, bizDate: d2, time: '08:12:40', ts: todayAt(8, 12) - 2 * DAY,
+        delta: 15, balance: 0, note: '任务结算：今日抽奖3次', kind: 'reward',
+        refId: 'seed-tc1', refType: 'task-claim'
+      })
+      // 上一业务日：2 次有效参与 + 1 笔风控冻结（审核中暂缓计入）→ 任务 2/3 未达成；
+      // 该跨日审核单放行后按归属业务日 d1 补计进度并结算，撤销则确认不计入
+      ;[['18:03:11', 18, 3], ['18:05:26', 18, 5]].forEach(([time, h, m], i) => {
+        this.records.push({
+          id: `seed-rd1-${i}`, type: 'draw', status: 'normal',
+          date: d1, time, ts: todayAt(h, m) - DAY,
+          activityId: 'act-1', activityName: '周年庆幸运转盘',
+          prizeId: 'p6', prizeName: '谢谢参与', rarity: 'none', icon: '🤝'
+        })
+      })
+      const pCardD1 = a1?.prizes.find((p) => p.id === 'p2')
+      // 与待审核单一致：remain 已扣、frozen 预占 1（放行核销 / 撤销回补）
+      if (pCardD1) { pCardD1.remain -= 1; pCardD1.frozen += 1 }
+      const rec6 = {
+        id: 'seed-r6', type: 'draw', status: 'frozen',
+        date: d1, time: '18:06:40', ts: todayAt(18, 6) - DAY,
+        activityId: 'act-1', activityName: '周年庆幸运转盘',
+        prizeId: 'p2', prizeName: '500元购物卡', rarity: 'epic', icon: '💳',
+        riskOrderId: 'seed-rk6'
+      }
+      this.records.push(rec6)
+      this.riskOrders.push({
+        id: 'seed-rk6', bizType: 'draw', status: 'pending', userId: uid, userName: uname,
+        recordId: rec6.id, activityId: 'act-1', targetId: 'p2', targetName: '500元购物卡',
+        icon: '💳', rarity: 'epic', frozenPoints: 0, stockHeld: 1,
+        rules: [{ code: 'highValue', label: RULE_LABELS.highValue }],
+        appealReason: '', appealAt: '', reviewNote: '', reviewer: '',
+        createdAt: d1, time: '18:06:40', ts: todayAt(18, 6) - DAY, reviewedAt: ''
+      })
+
+      // —— 7) 实物发货流程种子 ——
+      // 7a) 已放行实物（seed-r4：500元购物卡）→ 用户已填地址、运营已接单发货、待用户确认收货（轨迹已同步至派送中）
+      this.shipments.push({
+        id: 'seed-sp1', recordId: 'seed-r4', bizType: 'draw', status: 'shipped',
+        userId: uid, userName: uname, icon: '💳', targetName: '500元购物卡',
+        activityId: 'act-1', source: '风控放行',
+        date: this.todayDate, time: '09:12:00', ts: todayAt(9, 12),
+        receiver: '李运营', phone: '138****0001', region: '上海市浦东新区',
+        address: '张江高科技园区博云路2号', addressAt: `${this.todayDate} 09:20:11`,
+        shipper: '运营小张', carrier: '顺丰速运', trackingNo: 'SF1024888661',
+        shipNote: '内含购物卡，请当面验货', shippedAt: `${this.todayDate} 11:05:40`,
+        receivedAt: '',
+        traces: [
+          { stage: 'collected', text: '顺丰速运 已揽收包裹（单号 SF1024888661）', date: this.todayDate, time: '11:05:40', ts: todayAt(11, 5) },
+          { stage: 'transit', text: '包裹离开揽收网点，干线运输中，发往【上海市浦东新区】', date: this.todayDate, time: '13:40:12', ts: todayAt(13, 40) },
+          { stage: 'delivering', text: '包裹到达【上海市浦东新区】派送点，派送员王师傅 138****6666 正在派送', date: this.todayDate, time: '15:26:03', ts: todayAt(15, 26) }
+        ],
+        afterSaleId: '', returnedAt: '', originId: ''
+      })
+      // 7b) 正常兑换实物（定制帆布袋 150 积分）→ 待用户填写收货信息
+      const g3 = this.goods.find((g) => g.id === 'g3')
+      if (g3) { g3.remain -= 1 }
+      this.points -= 150
+      const rec7 = {
+        id: 'seed-r7', type: 'redeem', status: 'normal',
+        date: this.todayDate, time: '13:26:55', ts: todayAt(13, 26),
+        goodsId: 'g3', goodsName: '定制帆布袋', icon: '👜'
+      }
+      this.records.push(rec7)
+      this.pointRecords.unshift({
+        id: 'seed-pr7', date: this.todayDate, time: '13:26:55', ts: todayAt(13, 26),
+        delta: -150, balance: this.points, note: '兑换：定制帆布袋', kind: 'normal'
+      })
+      this.shipments.push({
+        id: 'seed-sp2', recordId: 'seed-r7', bizType: 'redeem', status: 'pending_address',
+        userId: uid, userName: uname, icon: '👜', targetName: '定制帆布袋',
+        activityId: null, source: '积分兑换',
+        date: this.todayDate, time: '13:26:55', ts: todayAt(13, 26),
+        receiver: '', phone: '', region: '', address: '', addressAt: '',
+        shipper: '', carrier: '', trackingNo: '', shipNote: '', shippedAt: '', receivedAt: '',
+        traces: [], afterSaleId: '', returnedAt: '', originId: ''
+      })
+
+      // —— 8) 历史业务日对账差异（演示）：上一业务日一笔 5 积分任务领奖台账已落、积分与流水漏记 ——
+      // 对账应在上一业务日差异单中检出（P1 净额 +5、P2 台账缺笔），运营复核后按跨日补偿补记，原始记录保留
+      this.taskClaims.push({
+        id: 'seed-tc-gap', taskId: 't-checkin', taskLabel: '每日签到（历史漏记）', reward: 5,
+        bizDate: d1, grantDate: d1, time: '18:40:00', ts: todayAt(18, 40) - DAY, source: 'manual-gap'
+      })
+
+      // —— 9) 售后闭环种子：昨日退货已完成（积分/库存已回写）+ 今日补发待审核 ——
+      // 9a) 昨日兑换盲盒福袋（200 积分）→ 已发货已签收 → 昨日申请退货并审核通过：
+      //     积分 +200 返还（昨日退款流水）、库存回补（g4 remain 净 0）、发货单 → 已退回、轨迹含退回节点
+      const g4seed = this.goods.find((g) => g.id === 'g4')
+      if (g4seed) { g4seed.remain -= 1 } // 昨日兑换扣减
+      this.points -= 200
+      const rec12 = {
+        id: 'seed-r12', type: 'redeem', status: 'normal',
+        date: d1, time: '16:20:33', ts: todayAt(16, 20) - DAY,
+        goodsId: 'g4', goodsName: '盲盒福袋', icon: '🎁'
+      }
+      this.records.push(rec12)
+      this.pointRecords.unshift({
+        id: 'seed-pr12', date: d1, time: '16:20:33', ts: todayAt(16, 20) - DAY,
+        delta: -200, balance: this.points, note: '兑换：盲盒福袋', kind: 'normal'
+      })
+      this.shipments.push({
+        id: 'seed-sp3', recordId: 'seed-r12', bizType: 'redeem', status: 'returned',
+        userId: uid, userName: uname, icon: '🎁', targetName: '盲盒福袋',
+        activityId: null, source: '积分兑换',
+        date: d1, time: '16:20:33', ts: todayAt(16, 20) - DAY,
+        receiver: '李运营', phone: '138****0001', region: '上海市浦东新区',
+        address: '张江高科技园区博云路2号', addressAt: `${d1} 16:25:01`,
+        shipper: '运营小王', carrier: '京东物流', trackingNo: 'JD7731029845',
+        shipNote: '', shippedAt: `${d1} 17:02:18`,
+        receivedAt: `${d1} 18:30:55`,
+        traces: [
+          { stage: 'collected', text: '京东物流 已揽收包裹（单号 JD7731029845）', date: d1, time: '17:02:18', ts: todayAt(17, 2) - DAY },
+          { stage: 'transit', text: '包裹离开揽收网点，干线运输中，发往【上海市浦东新区】', date: d1, time: '17:48:40', ts: todayAt(17, 48) - DAY },
+          { stage: 'delivering', text: '包裹到达【上海市浦东新区】派送点，派送员王师傅 138****6666 正在派送', date: d1, time: '18:12:06', ts: todayAt(18, 12) - DAY },
+          { stage: 'signed', text: '包裹已签收，签收人：本人（用户确认收货）', date: d1, time: '18:30:55', ts: todayAt(18, 30) - DAY },
+          { stage: 'returned', text: '退货包裹已退回发货仓，售后完成', date: d1, time: '19:05:44', ts: todayAt(19, 5) - DAY }
+        ],
+        afterSaleId: 'seed-as1', returnedAt: `${d1} 19:05:44`, originId: ''
+      })
+      if (g4seed) { g4seed.remain += 1 } // 退货审核通过：库存回补
+      this.points += 200
+      this.pointRecords.unshift({
+        id: 'seed-pr13', date: d1, time: '19:05:44', ts: todayAt(19, 5) - DAY,
+        delta: 200, balance: this.points, note: '售后退款：退货退款【盲盒福袋】（发货单 seed-sp3）',
+        kind: 'refund', refId: 'seed-as1', refType: 'after-sale'
+      })
+      this.afterSales.push({
+        id: 'seed-as1', shipmentId: 'seed-sp3', recordId: 'seed-r12',
+        userId: uid, userName: uname,
+        type: 'return', typeLabel: '退货退款',
+        reason: '福袋内容与活动描述不符，未拆封，申请退货退款',
+        status: 'done', icon: '🎁', targetName: '盲盒福袋',
+        targetType: 'goods', activityId: null, targetId: 'g4',
+        refundPoints: 200, reshipmentId: '',
+        createdAt: d1, time: '18:32:10', ts: todayAt(18, 32) - DAY,
+        reviewedAt: `${d1} 19:05:44`, reviewer: '运营小张',
+        reviewNote: '核实包裹未拆封已退回仓库，同意退货退款，库存与积分已回写'
+      })
+
+      // 9b) 今日再兑一件定制帆布袋（150 积分）→ 已发货已签收 → 用户申请补发（破损）待运营审核
+      if (g3) { g3.remain -= 1 }
+      this.points -= 150
+      const rec13 = {
+        id: 'seed-r13', type: 'redeem', status: 'normal',
+        date: this.todayDate, time: '10:48:21', ts: todayAt(10, 48),
+        goodsId: 'g3', goodsName: '定制帆布袋', icon: '👜'
+      }
+      this.records.push(rec13)
+      this.pointRecords.unshift({
+        id: 'seed-pr14', date: this.todayDate, time: '10:48:21', ts: todayAt(10, 48),
+        delta: -150, balance: this.points, note: '兑换：定制帆布袋', kind: 'normal'
+      })
+      this.shipments.push({
+        id: 'seed-sp4', recordId: 'seed-r13', bizType: 'redeem', status: 'received',
+        userId: uid, userName: uname, icon: '👜', targetName: '定制帆布袋',
+        activityId: null, source: '积分兑换',
+        date: this.todayDate, time: '10:48:21', ts: todayAt(10, 48),
+        receiver: '李运营', phone: '138****0001', region: '上海市浦东新区',
+        address: '张江高科技园区博云路2号', addressAt: `${this.todayDate} 10:50:02`,
+        shipper: '运营小张', carrier: '中通快递', trackingNo: 'ZT5531027768',
+        shipNote: '', shippedAt: `${this.todayDate} 12:15:30`,
+        receivedAt: `${this.todayDate} 15:40:22`,
+        traces: [
+          { stage: 'collected', text: '中通快递 已揽收包裹（单号 ZT5531027768）', date: this.todayDate, time: '12:15:30', ts: todayAt(12, 15) },
+          { stage: 'transit', text: '包裹离开揽收网点，干线运输中，发往【上海市浦东新区】', date: this.todayDate, time: '13:02:11', ts: todayAt(13, 2) },
+          { stage: 'delivering', text: '包裹到达【上海市浦东新区】派送点，派送员王师傅 138****6666 正在派送', date: this.todayDate, time: '14:58:47', ts: todayAt(14, 58) },
+          { stage: 'signed', text: '包裹已签收，签收人：本人（用户确认收货）', date: this.todayDate, time: '15:40:22', ts: todayAt(15, 40) }
+        ],
+        afterSaleId: '', returnedAt: '', originId: ''
+      })
+      this.afterSales.push({
+        id: 'seed-as2', shipmentId: 'seed-sp4', recordId: 'seed-r13',
+        userId: uid, userName: uname,
+        type: 'reship', typeLabel: '补发',
+        reason: '收到的帆布袋提手处开线破损，申请补发一件',
+        status: 'pending', icon: '👜', targetName: '定制帆布袋',
+        targetType: 'goods', activityId: null, targetId: 'g3',
+        refundPoints: 0, reshipmentId: '',
+        createdAt: this.todayDate, time: '16:05:18', ts: todayAt(16, 5),
+        reviewedAt: '', reviewer: '', reviewNote: ''
+      })
+
+      // —— 10) 卡券账户与核销种子 ——
+      // 10a) 今日正常兑换：满50减10优惠券（30 积分）→ 待核销，用户可出示券码
+      const g1now = this.goods.find((g) => g.id === 'g1')
+      if (g1now) g1now.remain -= 1
+      this.points -= 30
+      const rec8 = {
+        id: 'seed-r8', type: 'redeem', status: 'normal',
+        date: this.todayDate, time: '14:02:11', ts: todayAt(14, 2),
+        goodsId: 'g1', goodsName: '满50减10优惠券', couponId: 'c-discount-10', icon: '🎟️'
+      }
+      this.records.push(rec8)
+      this.pointRecords.unshift({
+        id: 'seed-pr8', date: this.todayDate, time: '14:02:11', ts: todayAt(14, 2),
+        delta: -30, balance: this.points, note: '兑换：满50减10优惠券', kind: 'normal'
+      })
+
+      // 10b) 今日正常兑换：视频会员周卡（80 积分）→ 今日已由运营核销
+      const g2now = this.goods.find((g) => g.id === 'g2')
+      if (g2now) g2now.remain -= 1
+      this.points -= 80
+      const rec9 = {
+        id: 'seed-r9', type: 'redeem', status: 'normal',
+        date: this.todayDate, time: '11:18:40', ts: todayAt(11, 18),
+        goodsId: 'g2', goodsName: '视频会员周卡', couponId: 'c-video-week', icon: '🎬'
+      }
+      this.records.push(rec9)
+      this.pointRecords.unshift({
+        id: 'seed-pr9', date: this.todayDate, time: '11:18:40', ts: todayAt(11, 18),
+        delta: -80, balance: this.points, note: '兑换：视频会员周卡', kind: 'normal'
+      })
+
+      // 10c) 10 天前兑换：满50减10优惠券（30 积分）→ 30 天有效，今日已核销（历史核销留痕）
+      if (g1now) g1now.remain -= 1
+      this.points -= 30
+      const rec10 = {
+        id: 'seed-r10', type: 'redeem', status: 'normal',
+        date: dateStr(-10), time: '10:30:00', ts: todayAt(10, 30) - 10 * DAY,
+        goodsId: 'g1', goodsName: '满50减10优惠券', couponId: 'c-discount-10', icon: '🎟️'
+      }
+      this.records.push(rec10)
+      this.pointRecords.unshift({
+        id: 'seed-pr10', date: dateStr(-10), time: '10:30:00', ts: todayAt(10, 30) - 10 * DAY,
+        delta: -30, balance: this.points, note: '兑换：满50减10优惠券', kind: 'normal'
+      })
+
+      // 10d) 13 天前兑换：满50减10优惠券（30 积分）→ 已过期（发券 + 到期两条台账）
+      if (g1now) g1now.remain -= 1
+      this.points -= 30
+      const rec11 = {
+        id: 'seed-r11', type: 'redeem', status: 'normal',
+        date: dateStr(-13), time: '09:05:00', ts: todayAt(9, 5) - 13 * DAY,
+        goodsId: 'g1', goodsName: '满50减10优惠券', couponId: 'c-discount-10', icon: '🎟️'
+      }
+      this.records.push(rec11)
+      this.pointRecords.unshift({
+        id: 'seed-pr11', date: dateStr(-13), time: '09:05:00', ts: todayAt(9, 5) - 13 * DAY,
+        delta: -30, balance: this.points, note: '兑换：满50减10优惠券', kind: 'normal'
+      })
+
+      // 卡券实例（直接落账户；状态机字段完整，供出示/核销/到期/对账各场景演示）
+      const tplDisc = this.couponTpls['c-discount-10']
+      const tplWeek = this.couponTpls['c-video-week']
+      const mkCouponSeed = (id, tpl, rec, status, issueDate, patch = {}) => {
+        const exp = this._couponExpiry(tpl, issueDate)
+        return {
+          id, code: patch.code, tplId: tpl.id, name: tpl.name, type: tpl.type,
+          typeLabel: COUPON_TYPES[tpl.type]?.label || tpl.type, emoji: tpl.emoji,
+          denomination: tpl.denomination || 0, threshold: tpl.threshold || 0,
+          face: tpl.face || '', desc: tpl.desc || '', validityDays: tpl.validityDays || 30,
+          status, userId: uid, userName: uname, recordId: rec.id, bizType: rec.type,
+          activityId: null, source: '积分兑换',
+          issueDate, time: rec.time, ts: rec.ts + 1,
+          expireDate: exp.date, expireTs: exp.ts,
+          redeemedAt: '', redeemOperator: '', redeemChannel: '', redeemNote: '',
+          compensateBillId: '', comp: false, ...patch
+        }
+      }
+      const cpAvail = mkCouponSeed('seed-cp1', tplDisc, rec8, 'available', this.todayDate, { code: 'CP-A1B2C-3D4E5' })
+      const cpRedeemToday = mkCouponSeed('seed-cp2', tplWeek, rec9, 'redeemed', this.todayDate, {
+        code: 'CP-W7K8M-9P2QR', redeemedAt: `${this.todayDate} 15:20:36`,
+        redeemOperator: '运营小张', redeemChannel: '到店扫码', redeemNote: '门店 POS 扫码核销，已开通 7 天会员'
+      })
+      const cpRedeemHist = mkCouponSeed('seed-cp3', tplDisc, rec10, 'redeemed', dateStr(-10), {
+        code: 'CP-H5J6N-8K3LM', redeemedAt: `${dateStr(-8)} 16:02:09`,
+        redeemOperator: '运营小王', redeemChannel: '到店扫码', redeemNote: '历史核销'
+      })
+      const cpExpired = mkCouponSeed('seed-cp4', tplDisc, rec11, 'expired', dateStr(-13), { code: 'CP-E9X2T-6V4ZW' })
+      this.coupons.push(cpExpired, cpRedeemHist, cpRedeemToday, cpAvail)
+
+      // 卡券业务台账（append-only，按时间倒序：核销/发放/到期/预占/释放）
+      this.couponLogs = [
+        { id: 'seed-cl9', action: 'redeem', actionLabel: '卡券核销', couponId: cpRedeemToday.id, code: cpRedeemToday.code, tplId: tplWeek.id, tplName: tplWeek.name, recordId: rec9.id, bizType: 'redeem', orderId: '', operator: '运营(运营小张)', note: '到店扫码：门店 POS 扫码核销，已开通 7 天会员', date: this.todayDate, time: '15:20:36', ts: todayAt(15, 20) },
+        { id: 'seed-cl8', action: 'issue', actionLabel: '卡券发放', couponId: cpAvail.id, code: cpAvail.code, tplId: tplDisc.id, tplName: tplDisc.name, recordId: rec8.id, bizType: 'redeem', orderId: '', operator: uname, note: '', date: this.todayDate, time: '14:02:11', ts: todayAt(14, 2) + 1 },
+        { id: 'seed-cl7', action: 'issue', actionLabel: '卡券发放', couponId: cpRedeemToday.id, code: cpRedeemToday.code, tplId: tplWeek.id, tplName: tplWeek.name, recordId: rec9.id, bizType: 'redeem', orderId: '', operator: uname, note: '', date: this.todayDate, time: '11:18:40', ts: todayAt(11, 18) + 1 },
+        { id: 'seed-cl6', action: 'hold', actionLabel: '风控预占', couponId: '', code: '', tplId: 'c-video-month', tplName: '视频月卡', recordId: 'seed-r2', bizType: 'draw', orderId: 'seed-rk2', operator: uname, note: '风控冻结，券库存预占、待放行交付', date: this.todayDate, time: '09:40:08', ts: todayAt(9, 40) },
+        { id: 'seed-cl5', action: 'redeem', actionLabel: '卡券核销', couponId: cpRedeemHist.id, code: cpRedeemHist.code, tplId: tplDisc.id, tplName: tplDisc.name, recordId: rec10.id, bizType: 'redeem', orderId: '', operator: '运营(运营小王)', note: '到店扫码：历史核销', date: dateStr(-8), time: '16:02:09', ts: todayAt(16, 2) - 8 * DAY },
+        { id: 'seed-cl4', action: 'issue', actionLabel: '卡券发放', couponId: cpRedeemHist.id, code: cpRedeemHist.code, tplId: tplDisc.id, tplName: tplDisc.name, recordId: rec10.id, bizType: 'redeem', orderId: '', operator: uname, note: '', date: dateStr(-10), time: '10:30:00', ts: todayAt(10, 30) - 10 * DAY + 1 },
+        { id: 'seed-cl3', action: 'expire', actionLabel: '到期失效', couponId: cpExpired.id, code: cpExpired.code, tplId: tplDisc.id, tplName: tplDisc.name, recordId: rec11.id, bizType: 'redeem', orderId: '', operator: '系统', note: '到期日 23:59 后自动失效', date: dateStr(-11), time: '00:00:05', ts: todayAt(0, 0) - 11 * DAY + 5000 },
+        { id: 'seed-cl2', action: 'issue', actionLabel: '卡券发放', couponId: cpExpired.id, code: cpExpired.code, tplId: tplDisc.id, tplName: tplDisc.name, recordId: rec11.id, bizType: 'redeem', orderId: '', operator: uname, note: '', date: dateStr(-13), time: '09:05:00', ts: todayAt(9, 5) - 13 * DAY + 1 },
+        { id: 'seed-cl1', action: 'revoke', actionLabel: '撤销释放', couponId: '', code: '', tplId: 'c-video-week', tplName: '视频会员周卡', recordId: 'seed-r5', bizType: 'redeem', orderId: 'seed-rk5', operator: '系统', note: '风控撤销，券库存回补、券未发放', date: this.todayDate, time: '08:35:00', ts: todayAt(8, 35) }
+      ]
+
+      // 初始可用积分 255（含一笔历史漏记：业务台账 +5 未入账）：
+      // 种子实时积分变动 -680（冻结 -10/-200、撤销冻结 -80 后返还 +80 净 0、
+      // 实物帆布袋 -150×2、售后退货 -200 后退款 +200 净 0、卡券兑换 满减券×3 -90 与周卡 -80），起点补 935 → 255。
+      // 种子流水合计 -665，rebalanceSeedPoints 倒推重放后链连续、最新快照 255。
+      // 对账检出并补偿历史漏记 +5 后余额 260，与补偿流水链配平。
+      this.points += 935
+      // 修正流水余额快照（append-only，重排后顺序写入当时余额）
+      this.rebalanceSeedPoints()
+
+      // 审计日志（最新在前）
+      this.auditLogs = [
+        { id: 'seed-log12', action: 'coupon-redeem', actionLabel: '卡券核销', orderId: '', operator: '运营(运营小张)', detail: `核销卡券【视频会员周卡】券码 ${cpRedeemToday.code}（用户 ${uname}，渠道 到店扫码，有效期至 ${cpRedeemToday.expireDate}）；备注：门店 POS 扫码核销，已开通 7 天会员`, date: this.todayDate, time: '15:20:36' },
+        { id: 'seed-log11', action: 'coupon-issue', actionLabel: '卡券发放', orderId: '', operator: uname, detail: `发放卡券【满50减10优惠券】（券码 ${cpAvail.code}，有效期至 ${cpAvail.expireDate}）：积分兑换【满50减10优惠券】`, date: this.todayDate, time: '14:02:11' },
+        { id: 'seed-log10', action: 'coupon-hold', actionLabel: '卡券预占', orderId: 'seed-rk2', operator: uname, detail: '抽奖【视频月卡】风控冻结：券库存预占 1，券码待放行后交付', date: this.todayDate, time: '09:40:08' },
+        { id: 'seed-log9', action: 'ship-create', actionLabel: '生成发货单', orderId: 'seed-sp2', operator: uname, detail: '兑换实物【定制帆布袋】生成发货单，待用户填写收货信息', date: this.todayDate, time: '13:26:55' },
+        { id: 'seed-log8', action: 'ship-send', actionLabel: '运营发货', orderId: 'seed-sp1', operator: '运营小张', detail: '接单发货【500元购物卡】：顺丰速运 单号 SF1024888661，收件人 李运营（上海市浦东新区 张江高科技园区博云路2号）；备注：内含购物卡，请当面验货', date: this.todayDate, time: '11:05:40' },
+        { id: 'seed-log5', action: 'revoke', actionLabel: '审核撤销', orderId: 'seed-rk5', operator: '系统', detail: '撤销兑换【视频会员周卡】，返还80积分、回补库存×1、释放预占券（未发放）；备注：命中短时连续兑换规则，自动拦截，用户未申诉。', date: this.todayDate, time: '08:35:00' },
+        { id: 'seed-log4', action: 'release', actionLabel: '审核放行', orderId: 'seed-rk4', operator: '运营小张', detail: '放行抽奖【500元购物卡】；备注：核实为正常用户，放行并发奖。', date: this.todayDate, time: '09:10:12' },
+        { id: 'seed-log3', action: 'appeal', actionLabel: '用户申诉', orderId: 'seed-rk2', operator: uname, detail: '用户提交申诉：本人正常参与活动中奖，未使用任何外挂，请求放行。', date: this.todayDate, time: '09:45:30' },
+        { id: 'seed-log2', action: 'freeze', actionLabel: '风控冻结', orderId: 'seed-rk3', operator: uname, detail: '兑换【盲盒福袋】命中规则：高价值奖品/兑换、短时间连续兑换，冻结200积分、预占库存×1', date: this.todayDate, time: '09:15:22' },
+        { id: 'seed-log1', action: 'freeze', actionLabel: '风控冻结', orderId: 'seed-rk1', operator: uname, detail: '抽奖【iPhone 16】命中规则：高价值奖品/兑换，冻结0积分、预占库存×1；该笔暂缓计入抽奖任务进度', date: this.todayDate, time: '10:02:15' },
+        { id: 'seed-log6', action: 'freeze', actionLabel: '风控冻结', orderId: 'seed-rk6', operator: uname, detail: `抽奖【500元购物卡】命中规则：高价值奖品/兑换，冻结0积分、预占库存×1；该笔暂缓计入抽奖任务进度（归属业务日 ${d1}，跨日审核单）`, date: d1, time: '18:06:40' },
+        { id: 'seed-log7', action: 'task-settle', actionLabel: '任务结算', orderId: '', operator: '系统', detail: `抽奖任务【今日抽奖3次】达成（${d2} 有效参与 3/3），自动发放 15 积分`, date: d2, time: '08:12:40' }
+      ]
+
+      // —— 11) 星河商贸种子数据统一补打租户/追踪标记（历史种子按默认租户 t-star 归属） ——
+      const tagStar = (list, fields = {}) => list.forEach((x) => {
+        if (x.tenantId === undefined) x.tenantId = 't-star'
+        Object.assign(x, fields)
+      })
+      tagStar(this.activities)
+      tagStar(this.goods)
+      tagStar(this.records, { userId: uid, userName: uname })
+      tagStar(this.riskOrders)
+      tagStar(this.shipments)
+      tagStar(this.afterSales)
+      tagStar(this.coupons)
+      tagStar(this.couponLogs)
+      tagStar(this.pointRecords)
+      tagStar(this.taskClaims)
+      this.auditLogs.forEach((l) => {
+        if (l.tenantId === undefined) l.tenantId = 't-star'
+        if (l.module === undefined) l.module = moduleOfAction(l.action)
+        if (l.result === undefined) l.result = 'success'
+        if (l.traceId === undefined) l.traceId = ''
+        if (l.actorKind === undefined) l.actorKind = l.operator && l.operator.startsWith('运营') ? 'staff' : (l.operator === '系统' ? 'system' : 'customer')
+        if (l.memberId === undefined) l.memberId = l.operator === '运营小张' ? 'm-star-ops' : l.operator === '运营小王' ? 'm-cloud-ops' : ''
+        if (l.ip === undefined) l.ip = l.actorKind === 'staff' ? '10.10.1.21' : '112.65.*.*'
+        if (l.channel === undefined) l.channel = l.actorKind === 'staff' ? '运营后台' : '移动端 H5'
+        if (l.logTs === undefined) {
+          const hh = parseInt((l.time || '00:00:00').slice(0, 2)) || 0
+          const mm = parseInt((l.time || '00:00:00').slice(3, 5)) || 0
+          l.logTs = todayAt(hh, mm)
+        }
+      })
+
+      // —— 12) 第二租户云雀数科种子：独立活动/商品/卡券/审核单/发货单，与星河商贸数据强隔离 ——
+      this.seedCloudTenant()
+    },
+
+    // 第二租户（t-cloud）演示数据：零积分成本活动 + 0 积分券兑换（不参与平台积分余额链）
+    seedCloudTenant() {
+      const tid = 't-cloud'
+      const uid = this.user.id
+      const uname = this.user.name
+      const cloudAct = this.activities.find((a) => a.id === 'cact-1')
+      const pSvip = cloudAct?.prizes.find((p) => p.id === 'cp1')
+      const tplWelcome = this.couponTpls['cc-welcome']
+
+      // 1) 今日 0 积分兑换新人立减券 → 待核销（独立券码段 CPC-）
+      const cg1 = this.goods.find((g) => g.id === 'cg1')
+      if (cg1) cg1.remain -= 1
+      const recC1 = {
+        id: 'seed-cr1', type: 'redeem', status: 'normal', tenantId: tid,
+        userId: uid, userName: uname,
+        date: this.todayDate, time: '10:12:30', ts: todayAt(10, 12),
+        goodsId: 'cg1', goodsName: '云雀新人立减券', couponId: 'cc-welcome', icon: '🐦'
+      }
+      this.records.push(recC1)
+      const expW = this._couponExpiry(tplWelcome, this.todayDate)
+      this.coupons.push({
+        id: 'seed-ccp1', code: 'CPC-CL0UD-WELCM', tplId: 'cc-welcome', name: tplWelcome.name,
+        type: tplWelcome.type, typeLabel: '新人立减券', emoji: '🐦',
+        denomination: 5, threshold: 0, face: '', desc: tplWelcome.desc, validityDays: 20,
+        status: 'available', tenantId: tid, userId: uid, userName: uname,
+        recordId: recC1.id, bizType: 'redeem', activityId: null, source: '积分兑换',
+        issueDate: this.todayDate, time: '10:12:30', ts: todayAt(10, 12) + 1,
+        traceId: '', expireDate: expW.date, expireTs: expW.ts,
+        redeemedAt: '', redeemOperator: '', redeemChannel: '', redeemNote: '',
+        compensateBillId: '', comp: false
+      })
+
+      // 2) 今日转盘抽中 SVIP 季卡命中风控：券库存预占、券未发出（待云雀风控专员/管理员处理）
+      if (pSvip) { pSvip.remain -= 1; pSvip.frozen += 1 }
+      const recC2 = {
+        id: 'seed-cr2', type: 'draw', status: 'frozen', tenantId: tid,
+        userId: uid, userName: uname,
+        date: this.todayDate, time: '11:05:50', ts: todayAt(11, 5),
+        activityId: 'cact-1', activityName: '云雀上线幸运转盘',
+        prizeId: 'cp1', prizeName: '云雀 SVIP 季卡', rarity: 'legendary',
+        couponId: 'cc-svip', icon: '💎', riskOrderId: 'seed-crk1'
+      }
+      this.records.push(recC2)
+      this.riskOrders.push({
+        id: 'seed-crk1', bizType: 'draw', status: 'pending', tenantId: tid,
+        userId: uid, userName: uname,
+        recordId: recC2.id, activityId: 'cact-1', targetId: 'cp1', targetName: '云雀 SVIP 季卡',
+        icon: '💎', rarity: 'legendary', frozenPoints: 0, stockHeld: 1,
+        rules: [{ code: 'highValue', label: RULE_LABELS.highValue }],
+        appealReason: '', appealAt: '', reviewNote: '', reviewer: '',
+        createdAt: this.todayDate, time: '11:05:50', ts: todayAt(11, 5), reviewedAt: ''
+      })
+
+      // 3) 昨日已签收的马克杯订单（实物闭环演示；不制造积分流水）
+      const cg2 = this.goods.find((g) => g.id === 'cg2')
+      if (cg2) cg2.remain -= 1
+      const d1 = dateStr(-1)
+      const recC3 = {
+        id: 'seed-cr3', type: 'redeem', status: 'normal', tenantId: tid,
+        userId: uid, userName: uname,
+        date: d1, time: '15:22:10', ts: todayAt(15, 22) - 86400000,
+        goodsId: 'cg2', goodsName: '云雀定制马克杯', icon: '☕'
+      }
+      this.records.push(recC3)
+      this.shipments.push({
+        id: 'seed-csp1', recordId: recC3.id, bizType: 'redeem', status: 'received',
+        tenantId: tid, traceId: '', userId: uid, userName: uname,
+        icon: '☕', targetName: '云雀定制马克杯', activityId: null, source: '积分兑换',
+        date: d1, time: '15:22:10', ts: todayAt(15, 22) - 86400000,
+        receiver: '运营测试用户', phone: '138****0001', region: '浙江省杭州市西湖区',
+        address: '文三路云雀大厦 9 层', addressAt: `${d1} 15:30:00`,
+        shipper: '运营小冯', carrier: '圆通速递', trackingNo: 'YT992100046',
+        shipNote: '', shippedAt: `${d1} 17:10:00`, receivedAt: this.todayDate + ' 10:20:00',
+        traces: [
+          { stage: 'collected', text: '圆通速递 已揽收包裹（单号 YT992100046）', date: d1, time: '17:10:00', ts: todayAt(17, 10) - 86400000 },
+          { stage: 'signed', text: '包裹已签收，签收人：本人（用户确认收货）', date: this.todayDate, time: '10:20:00', ts: todayAt(10, 20) }
+        ],
+        afterSaleId: '', returnedAt: '', originId: ''
+      })
+
+      // 4) 卡券台账与审计留痕（append-only）
+      this.couponLogs.push(
+        { id: 'seed-ccl2', action: 'hold', actionLabel: '风控预占', couponId: '', code: '', tplId: 'cc-svip', tplName: '云雀 SVIP 季卡', recordId: recC2.id, bizType: 'draw', orderId: 'seed-crk1', tenantId: tid, traceId: '', operator: uname, note: '风控冻结，券库存预占、待放行交付', date: this.todayDate, time: '11:05:50', ts: todayAt(11, 5) },
+        { id: 'seed-ccl1', action: 'issue', actionLabel: '卡券发放', couponId: 'seed-ccp1', code: 'CPC-CL0UD-WELCM', tplId: 'cc-welcome', tplName: tplWelcome.name, recordId: recC1.id, bizType: 'redeem', orderId: '', tenantId: tid, traceId: '', operator: uname, note: '', date: this.todayDate, time: '10:12:30', ts: todayAt(10, 12) + 1 }
+      )
+      const cloudAudit = (id, action, label, orderId, operator, detail, date, time, result = 'success', module = moduleOfAction(action)) => ({
+        id, action, actionLabel: label, module, orderId, operator,
+        actorKind: operator.startsWith('运营') ? 'staff' : operator === '系统' ? 'system' : 'customer',
+        memberId: operator === '运营小冯' ? 'm-cloud-ops' : '',
+        tenantId: tid, traceId: '', channel: operator.startsWith('运营') ? '运营后台' : '移动端 H5',
+        ip: operator.startsWith('运营') ? '172.16.2.20' : '112.65.*.*', result,
+        detail, date, time,
+        logTs: (() => { const hh = parseInt(time.slice(0, 2)); const mm = parseInt(time.slice(3, 5)); return todayAt(hh, mm) - (date === this.todayDate ? 0 : 86400000) })()
+      })
+      this.auditLogs.push(
+        cloudAudit('seed-clog4', 'freeze', '风控冻结', 'seed-crk1', uname, '云雀数科：抽奖【云雀 SVIP 季卡】命中规则：高价值奖品/兑换，预占库存×1；该笔暂缓计入抽奖任务进度', this.todayDate, '11:05:50'),
+        cloudAudit('seed-clog3', 'ship-receive', '确认收货', 'seed-csp1', uname, '确认收货【云雀定制马克杯】（圆通速递 YT992100046），订单完成', this.todayDate, '10:20:00'),
+        cloudAudit('seed-clog2', 'ship-send', '运营发货', 'seed-csp1', '运营小冯', '云雀数科：接单发货【云雀定制马克杯】：圆通速递 单号 YT992100046', d1, '17:10:00'),
+        cloudAudit('seed-clog1', 'coupon-issue', '卡券发放', '', uname, '云雀数科：发放卡券【云雀新人立减券】（券码 CPC-CL0UD-WELCM）：0 积分兑换', this.todayDate, '10:12:30'),
+        // 权限中心演示：越权访问与停用账号登录被拒绝（result=denied）
+        cloudAudit('seed-clog-deny1', 'cross-tenant-denied', '越权拦截', '', '仓配小李',
+          '⛔ 星河商贸员工【仓配小李】尝试切换/访问云雀数科数据被拒绝（数据强隔离：员工仅可访问归属租户）',
+          this.todayDate, '08:40:12', 'denied', 'auth'),
+        cloudAudit('seed-clog-deny2', 'perm-denied', '权限拦截', '', '客服小吴',
+          '⛔ 停用账号【客服小吴】尝试登录被拒绝（离职停用）',
+          this.todayDate, '09:02:44', 'denied', 'auth')
+      )
+    },
+
+    // 按时间正序重放种子流水，修正每行 balance 快照
+    rebalanceSeedPoints() {
+      const seeds = this.pointRecords.filter((p) => p.id.startsWith('seed-'))
+      if (!seeds.length) return
+      const sorted = [...seeds].sort((a, b) => a.ts - b.ts)
+      let bal = this.points - sorted.reduce((s, p) => s + p.delta, 0)
+      sorted.forEach((p) => {
+        bal += p.delta
+        p.balance = bal
+      })
+    }
+  }
+})
