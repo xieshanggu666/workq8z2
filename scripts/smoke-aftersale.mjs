@@ -129,7 +129,7 @@ assert(s.pendingShipCount === 1, '补发单进入运营待发货队列')
 assert(s.shipShipment(reship.id, { carrier: '韵达快递', trackingNo: 'YD666' }) === true, '补发单可正常发货')
 assert(reship.traces.some((t) => t.stage === 'collected'), '补发单发货生成揽收节点')
 
-console.log('— 异常回退：补发库存不足整体不落账 —')
+console.log('— 缺货挂起：补发审核缺货 → waiting_stock，采购入库后从待处理售后继续履约 —')
 // 再造一笔已收货订单并申请补发，然后把库存清零模拟缺货
 s.setRole('user')
 const rec2 = s.redeem('g3')
@@ -141,18 +141,44 @@ s.setRole('user')
 s.receiveShipment(spNew2.id)
 const apply4 = s.applyAfterSale(spNew2.id, 'reship', '少发了一件，申请补发')
 assert(apply4?.status === 'pending', '第二笔补发申请已提交')
-const g3Zero = g3().remain
-g3().remain = 0 // 模拟缺货
+const g3Zero = g3().remain // 缺货挂起前的真实余量（仅用于演示结束后把账面还原回真实水平）
+g3().remain = 0 // 模拟仓库实物缺货
 const ptsBeforeFail = s.points
 const shipCountBeforeFail = s.shipments.length
 s.setRole('operator')
-assert(s.reviewAfterSale(apply4.id, true, '尝试同意') === false, '库存不足：补发审核被拦截')
-assert(apply4.status === 'pending', '售后单保持待审核（可补货后再审或驳回）')
+assert(s.reviewAfterSale(apply4.id, true, '缺货挂起') === true, '库存不足：补发审核通过但转挂起（返回 true）')
+assert(apply4.status === 'waiting_stock' && !!apply4.shortageNote, '售后单 → 待补货（不动账，等待采购入库）')
+assert(s.pendingOrWaitingAfterSaleCount >= 1 && s.waitingStockAfterSaleCount >= 1, '待补货单计入待处理售后队列/角标')
 assert(s.points === ptsBeforeFail && s.shipments.length === shipCountBeforeFail && g3().remain === 0,
-  '异常回退：积分/发货单/库存均未部分落账')
-g3().remain = g3Zero // 恢复库存
-assert(s.reviewAfterSale(apply4.id, true, '补货后同意补发') === true, '补货后审核通过')
-assert(apply4.status === 'done' && g3().remain === g3Zero - 1, '补发落账：库存扣减 1')
+  '挂起不落账：积分/发货单/库存均未变动')
+// 驳回待补货单（可选路径）：验证 waiting_stock 不可驳回，只能继续履约
+assert(s.reviewAfterSale(apply4.id, false) === false, '待补货单不可驳回（只能继续履约）')
+// 走采购链路补货：从待补货售后单一键发起（采购单回指售后单，入完后从待处理售后继续履约）
+const po = s.createPurchaseOrder({
+  targetType: apply4.targetType, targetId: apply4.targetId, activityId: apply4.activityId,
+  qty: 10, reason: '缺货补发采购', afterSaleId: apply4.id
+})
+assert(!!po && po.afterSaleId === apply4.id, '可从待处理售后单发起采购（采购单关联售后）')
+assert(s.reviewPurchaseOrder(po.id, true, '售后优先') === true, '采购审批通过')
+// 分批验收：先入 4 件（未入完，采购单保持 receiving）
+const b1 = s.inboundPurchase(po.id, { qty: 4, carrier: '测试供应商' })
+assert(!!b1 && b1.qty === 4 && g3().remain === 4, '首批验收入库 4 件（remain 0→4，stock 同步抬升）')
+assert(s.purchaseOrders.find((o) => o.id === po.id).status === 'receiving' &&
+  s.purchaseOrders.find((o) => o.id === po.id).inboundQty === 4, '未入完：采购单 → 分批验收中（累计 4/10）')
+// 超量验收被拦截（本次数量不得超过待收 6）
+assert(s.inboundPurchase(po.id, { qty: 999 }) === null, '累计验收不得超过审批数量')
+// 库存已有余量即可从待处理售后继续履约（不必等采购入完）
+assert(s.reviewAfterSale(apply4.id, true, '首批到货，继续补发履约') === true, '首批入库后即可从待处理售后继续履约')
+assert(apply4.status === 'done' && g3().remain === 3, '继续履约落账：补发再扣 1 件（4→3）')
+// 剩余批次入完，采购单转入库完成
+const b2 = s.inboundPurchase(po.id, { qty: 6, carrier: '测试供应商' })
+assert(!!b2 && g3().remain === 9, '剩余 6 件验收入库（3→9），累计入满 10 件')
+assert(s.purchaseOrders.find((o) => o.id === po.id).status === 'received', '入满：采购单 → 入库完成')
+// 已完成采购/售后重复操作均幂等拦截
+assert(s.inboundPurchase(po.id, { qty: 1 }) === null, '入库完成后重复验收被拦截')
+assert(s.reviewAfterSale(apply4.id, true) === false, '已完成售后单重复审核被拦截')
+// 演示环境账面还原：把模拟缺货前的真实余量补回（采购/补发链路已演示完毕）
+g3().remain += g3Zero
 
 console.log('— 对账口径：售后退款/退回/补发纳入 P1/P5，账实仍平衡 —')
 s.runRecon(today, true)

@@ -27,6 +27,10 @@
           <span class="hs-num aftersale">{{ store.pendingAfterSaleCount }}</span>
           <span class="hs-lab">售后待审核</span>
         </div>
+        <div class="hs-item">
+          <span class="hs-num shortage">{{ store.waitingStockAfterSaleCount }}</span>
+          <span class="hs-lab">缺货待补货</span>
+        </div>
       </div>
       <div class="role-box">
         <span class="role-tip">当前视角</span>
@@ -180,11 +184,14 @@
               <span class="asr-status" :class="as.status">{{ afterSaleStatusMeta(as.status).label }}</span>
             </div>
             <div class="asr-sub">原因：{{ as.reason }} · {{ as.createdAt }} {{ as.time }}</div>
-            <div v-if="as.status !== 'pending'" class="asr-sub">
+            <div v-if="as.status !== 'pending' && as.status !== 'waiting_stock'" class="asr-sub">
               {{ as.reviewedAt }} 由 {{ as.reviewer }} 处理
               <span v-if="as.reviewNote">；备注：{{ as.reviewNote }}</span>
               <span v-if="as.status === 'done' && as.refundPoints">；已返还 {{ as.refundPoints }} 积分</span>
               <span v-if="as.status === 'done' && as.reshipmentId">；补发单 {{ as.reshipmentId }}</span>
+            </div>
+            <div v-else-if="as.status === 'waiting_stock'" class="asr-sub shortage-text">
+              ⚠️ 审核通过但库存不足，已挂起「待补货」，采购入库后将继续补发
             </div>
             <div v-else class="asr-sub">等待运营审核…</div>
           </div>
@@ -306,7 +313,7 @@
           </button>
         </div>
       </div>
-      <p class="op-hint">审核通过即回写：拒收/退货 → 库存回补 + 积分返还 + 发货单退回；补发 → 库存扣减并生成补发发货单。驳回不动账，全部操作留痕。</p>
+      <p class="op-hint">审核通过即回写：拒收/退货 → 库存回补 + 积分返还 + 发货单退回；补发 → 库存扣减并生成补发发货单。补发缺货时不驳回、整单挂起「待补货」，采购验收入库后可从待处理售后继续履约。驳回不动账，全部操作留痕。</p>
 
       <div v-if="visibleAfterSales.length === 0" class="empty">暂无相关售后单</div>
 
@@ -325,11 +332,17 @@
         <div class="as-detail">
           <span class="asd-item">原因：{{ a.reason }}</span>
           <span v-if="a.refundPoints" class="asd-item refund">🪙 通过将返还 {{ a.refundPoints }} 积分</span>
-          <span v-if="a.type === 'reship'" class="asd-item">📦 通过将扣减库存并生成补发发货单</span>
-          <span v-else class="asd-item">📥 通过将回补库存 1 件</span>
+          <span v-if="a.type === 'reship' && a.status !== 'waiting_stock'" class="asd-item">📦 通过将扣减库存并生成补发发货单</span>
+          <span v-else-if="a.type !== 'reship'" class="asd-item">📥 通过将回补库存 1 件</span>
+        </div>
+        <!-- 缺货待补货：采购入库后继续履约 -->
+        <div v-if="a.status === 'waiting_stock'" class="as-waiting">
+          <span class="aw-text">⚠️ {{ a.shortageNote || '库存不足，已挂起待采购补货' }}（{{ a.reviewedAt }} 由 {{ a.reviewer }} 审核）</span>
+          <button class="btn-ghost sm" @click="goPurchase(a)">🛒 发起补货采购</button>
+          <button class="btn-approve sm" @click="review(a, true)">📦 库存已足，继续补发履约</button>
         </div>
         <!-- 待审核：操作区 -->
-        <div v-if="a.status === 'pending'" class="as-review">
+        <div v-else-if="a.status === 'pending'" class="as-review">
           <input v-model="reviewNoteOf(a).note" placeholder="审核备注（可选）" />
           <button class="btn-approve" @click="review(a, true)">✅ 同意{{ a.typeLabel }}</button>
           <button class="btn-reject" @click="review(a, false)">🚫 驳回</button>
@@ -417,9 +430,9 @@ function syncTrace(o) {
 
 // —— 售后申请（用户） ——
 const applyForm = reactive({})
-// 该发货单当前可申请的售后类型（与 store 状态机口径一致；已有待审核单时隐藏入口）
+// 该发货单当前可申请的售后类型（与 store 状态机口径一致；已有待处理单时隐藏入口）
 const afterSaleTypesOf = (o) => {
-  if (store.afterSalesOfShipment(o.id).some((a) => a.status === 'pending')) return []
+  if (store.afterSalesOfShipment(o.id).some((a) => a.status === 'pending' || a.status === 'waiting_stock')) return []
   if (o.status === 'shipped') return ['reject', 'reship']
   if (o.status === 'received') return ['return', 'reship']
   return []
@@ -479,6 +492,7 @@ function doShip(o) {
 // —— 售后审核（运营） ——
 const asFilters = [
   { key: 'pending', label: '待审核' },
+  { key: 'waiting_stock', label: '待补货' },
   { key: 'done', label: '已完成' },
   { key: 'dismissed', label: '已驳回' },
   { key: 'all', label: '全部' }
@@ -500,6 +514,10 @@ function review(a, approve) {
     reviewNotes[a.id].note = ''
   }
 }
+// 缺货待补货：跳转采购入库页（采购单可在该页从待处理售后单一键发起）
+function goPurchase(a) {
+  store.gotoTab('purchase')
+}
 </script>
 
 <style scoped>
@@ -519,6 +537,7 @@ function review(a, approve) {
 .hs-num.muted { color: #b0bec5; }
 .hs-num.bad { color: #ef9a9a; }
 .hs-num.aftersale { color: #ffcc80; }
+.hs-num.shortage { color: #ef9a9a; }
 .hs-lab { font-size: 11px; color: #9db0d0; margin-top: 5px; }
 
 .role-box { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
@@ -580,6 +599,7 @@ function review(a, approve) {
 .o-status.received { background: rgba(144,164,174,0.18); color: #b0bec5; }
 .o-status.returned { background: rgba(229,115,115,0.18); color: #ef9a9a; }
 .o-status.pending { background: rgba(255,152,0,0.18); color: #ffb74d; }
+.o-status.waiting_stock { background: rgba(229,115,115,0.2); color: #ef9a9a; }
 .o-status.done { background: rgba(76,175,80,0.18); color: #7ef0c9; }
 .o-status.dismissed { background: rgba(144,164,174,0.18); color: #b0bec5; }
 
@@ -678,9 +698,11 @@ function review(a, approve) {
 .asr-title { font-size: 12px; color: #eef3fc; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .asr-status { font-size: 10px; padding: 1px 8px; border-radius: 5px; }
 .asr-status.pending { background: rgba(255,152,0,0.18); color: #ffb74d; }
+.asr-status.waiting_stock { background: rgba(229,115,115,0.2); color: #ef9a9a; }
 .asr-status.done { background: rgba(76,175,80,0.18); color: #7ef0c9; }
 .asr-status.dismissed { background: rgba(144,164,174,0.18); color: #b0bec5; }
 .asr-sub { font-size: 10px; color: #7e97c2; margin-top: 2px; }
+.asr-sub.shortage-text { color: #ef9a9a; }
 
 .op-hint { font-size: 11px; color: #6f84ab; margin: 0 0 12px; }
 .op-wait {
@@ -716,6 +738,13 @@ function review(a, approve) {
 .as-detail { margin-top: 9px; display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; color: #aebadd; }
 .asd-item.refund { color: #ffd54f; }
 .as-review { margin-top: 10px; display: flex; gap: 8px; }
+.as-waiting {
+  margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: rgba(229,115,115,0.08); border: 1px solid rgba(229,115,115,0.3);
+  border-radius: 8px; padding: 9px 12px;
+}
+.aw-text { font-size: 11px; color: #ef9a9a; flex: 1; min-width: 200px; }
+.btn-ghost.sm, .btn-approve.sm { padding: 6px 12px; font-size: 11px; }
 .btn-approve {
   background: linear-gradient(135deg,#66bb6a,#43a047); color: #fff; border: none;
   border-radius: 8px; padding: 8px 16px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;

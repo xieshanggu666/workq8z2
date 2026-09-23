@@ -10,6 +10,7 @@ import { PERMISSION_LABELS } from './mock-perms.js'
 const PERMS = {
   reviewRisk: 'risk:review', ruleRisk: 'risk:rule',
   shipSend: 'ship:send', shipTrace: 'ship:trace', aftersaleReview: 'aftersale:review',
+  purchaseApply: 'purchase:apply', purchaseApprove: 'purchase:approve', purchaseInbound: 'purchase:inbound',
   couponRedeem: 'coupon:redeem',
   reconRun: 'recon:run', reconReview: 'recon:review', reconCompensate: 'recon:compensate',
   activityManage: 'activity:manage'
@@ -145,6 +146,12 @@ async function route(app, req, res, json) {
       .sort((a, b) => b.ts - a.ts)
     return json(res, 200, { afterSales: list })
   }
+  if (method === 'GET' && p === '/api/purchases') {
+    const list = app.k.state.purchaseOrders
+      .filter((o) => (o.tenantId || 't-star') === tid())
+      .sort((a, b) => b.ts - a.ts)
+    return json(res, 200, { purchases: list, batches: app.k.state.inboundBatches.filter((b) => (b.tenantId || 't-star') === tid()) })
+  }
   if (method === 'GET' && p === '/api/risk/orders') {
     const list = app.k.state.riskOrders
       .filter((o) => (o.tenantId || 't-star') === tid())
@@ -247,6 +254,35 @@ async function route(app, req, res, json) {
     await app.auth.requireSameTenant(session, as.tenantId, 'aftersale')
     const row = await app.ship.reviewAfterSale(body.afterSaleId, !!body.approve, body.note || '', session)
     return json(res, 200, { ok: true, afterSale: row })
+  }
+  if (method === 'POST' && p === '/api/purchases/create') {
+    await requireStaffPerm(app, session, PERMS.purchaseApply)
+    const row = await app.purchase.createOrder(body, session)
+    return json(res, 200, { ok: true, purchase: row })
+  }
+  if (method === 'POST' && p === '/api/purchases/review') {
+    await requireStaffPerm(app, session, PERMS.purchaseApprove)
+    const po = app.k.state.purchaseOrders.find((x) => x.id === body.purchaseId)
+    if (!po) throw new BizError('PO_NOT_FOUND', '采购单不存在', 404)
+    await app.auth.requireSameTenant(session, po.tenantId, 'purchase')
+    const row = await app.purchase.reviewOrder(body.purchaseId, !!body.approve, body.note || '', session)
+    return json(res, 200, { ok: true, purchase: row })
+  }
+  if (method === 'POST' && p === '/api/purchases/cancel') {
+    await requireStaffPerm(app, session, PERMS.purchaseApply)
+    const po = app.k.state.purchaseOrders.find((x) => x.id === body.purchaseId)
+    if (!po) throw new BizError('PO_NOT_FOUND', '采购单不存在', 404)
+    await app.auth.requireSameTenant(session, po.tenantId, 'purchase')
+    const row = await app.purchase.cancelOrder(body.purchaseId, session)
+    return json(res, 200, { ok: true, purchase: row })
+  }
+  if (method === 'POST' && p === '/api/purchases/inbound') {
+    await requireStaffPerm(app, session, PERMS.purchaseInbound)
+    const po = app.k.state.purchaseOrders.find((x) => x.id === body.purchaseId)
+    if (!po) throw new BizError('PO_NOT_FOUND', '采购单不存在', 404)
+    await app.auth.requireSameTenant(session, po.tenantId, 'purchase')
+    const r = await app.purchase.inbound(body.purchaseId, body, session)
+    return json(res, 200, { ok: true, ...r })
   }
   if (method === 'POST' && p === '/api/coupons/redeem') {
     await requireStaffPerm(app, session, PERMS.couponRedeem)
@@ -365,6 +401,11 @@ function dashboard(app, tid) {
       returned: app.k.state.shipments.filter((o) => inT(o) && o.status === 'returned').length
     },
     afterSalePending: app.k.state.afterSales.filter((a) => inT(a) && a.status === 'pending').length,
+    afterSaleWaiting: app.k.state.afterSales.filter((a) => inT(a) && a.status === 'waiting_stock').length,
+    purchasePending: app.k.state.purchaseOrders.filter((o) => inT(o) && o.status === 'pending').length,
+    purchaseToInbound: app.k.state.purchaseOrders.filter((o) => inT(o) && ['approved', 'receiving'].includes(o.status)).length,
+    purchaseReceived: app.k.state.purchaseOrders.filter((o) => inT(o) && o.status === 'received').length,
+    purchaseInboundQty: app.k.state.inboundBatches.filter((b) => inT(b)).reduce((n, b) => n + (b.qty || 0), 0),
     reconBills: app.k.state.reconBills.filter((b) => inT(b)).length,
     reconOpen: app.k.state.reconBills.filter((b) => inT(b) && ['pending', 'reviewed'].includes(b.status)).length
   }

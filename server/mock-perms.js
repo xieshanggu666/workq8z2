@@ -8,9 +8,9 @@ export const ROLE_TEMPLATES = [
   },
   {
     key: 'ops_activity', name: '活动运营', builtin: true,
-    desc: '负责抽奖活动与积分任务运营，可管理活动、查看积分台账',
+    desc: '负责抽奖活动与积分任务运营，可管理活动、发起奖品/商品采购、查看积分台账',
     icon: '🎪',
-    permissions: ['activity:manage', 'points:view', 'ship:trace']
+    permissions: ['activity:manage', 'points:view', 'ship:trace', 'purchase:apply']
   },
   {
     key: 'risk_analyst', name: '风控专员', builtin: true,
@@ -20,15 +20,15 @@ export const ROLE_TEMPLATES = [
   },
   {
     key: 'logistics_clerk', name: '物流客服', builtin: true,
-    desc: '负责实物接单发货、物流轨迹同步与售后审核',
+    desc: '负责实物接单发货、采购分批验收入库、物流轨迹同步与售后审核',
     icon: '📦',
-    permissions: ['ship:send', 'ship:trace', 'aftersale:review', 'points:view']
+    permissions: ['ship:send', 'ship:trace', 'aftersale:review', 'points:view', 'purchase:inbound']
   },
   {
     key: 'finance_auditor', name: '财务对账', builtin: true,
-    desc: '负责卡券核销、积分库存对账、复核补偿与全链路审计查看（只读业务运营）',
+    desc: '负责采购审批、卡券核销、积分库存对账、复核补偿与全链路审计查看（只读业务运营）',
     icon: '🧮',
-    permissions: ['coupon:redeem', 'recon:run', 'recon:review', 'recon:compensate', 'audit:view', 'points:view']
+    permissions: ['coupon:redeem', 'recon:run', 'recon:review', 'recon:compensate', 'audit:view', 'points:view', 'purchase:approve']
   },
   {
     key: 'service_readonly', name: '客服（只读）', builtin: true,
@@ -53,6 +53,9 @@ export const PERMISSION_LABELS = {
   'ship:send': '运营接单发货',
   'ship:trace': '物流轨迹同步',
   'aftersale:review': '售后审核',
+  'purchase:apply': '发起采购申请',
+  'purchase:approve': '采购审批',
+  'purchase:inbound': '分批验收入库',
   'coupon:redeem': '卡券核销',
   'recon:run': '执行对账',
   'recon:review': '对账复核',

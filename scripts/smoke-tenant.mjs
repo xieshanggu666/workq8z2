@@ -62,7 +62,7 @@ assert(dl.result === 'denied' && dl.module === 'risk' && dl.tenantId === 't-star
 console.log('— 跨租户隔离：星河员工不能操作/切换云雀 —')
 assert(s.switchTenant('t-cloud') === false, '员工切换非归属租户被拒绝')
 assert(s.activeTenantId === 't-star', '拒绝后数据上下文仍为星河')
-assert(s.shipmentStats.total === 4, `发货看板只统计星河（实际 ${s.shipmentStats.total}）`)
+assert(s.shipmentStats.total === 6, `发货看板只统计星河（实际 ${s.shipmentStats.total}）`)
 assert(s.pendingRedeemCount === 1, '待核销角标仅星河（云雀券不计入）')
 // 尝试直接核销云雀券码（构造调用）：当前星河租户下券码视为不可访问
 assert(s.redeemCoupon('CPC-CL0UD-WELCM') === null, '跨租户券码核销被拦截')

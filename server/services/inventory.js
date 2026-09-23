@@ -48,6 +48,10 @@ export class InventoryService {
   async replenish(target, qty = 1) {
     await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: qty, dFrozen: 0 }])
   }
+  // 采购验收入库：可用余量 +qty、账面总量 +qty（按验收批次实收，库存目标行需带 stock）
+  async receive(target, qty = 1, effectId = '') {
+    await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: qty, dFrozen: 0, dStock: qty, effectId: effectId || undefined }])
+  }
   // 对账库存校正（append 调整凭证由对账服务负责写，这里只动账面）
   async adjust(target, delta) {
     await this.k.commit([{ type: 'inv.mut', key: target.key, dRemain: delta, dFrozen: 0 }])

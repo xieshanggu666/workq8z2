@@ -389,12 +389,99 @@ async function testWALRecovery() {
   await app.k.close()
 }
 
+async function testPurchase() {
+  console.log('— 采购入库：审批状态机 / 分批验收幂等 / 缺货售后继续履约 —')
+  const db = tmpDb('purchase')
+  let app = await createApp({ dbFile: db, autoResume: false })
+  await disableRisk(app)
+  const ops = staffCtx(app, 'm-star-ops')
+  const fin = staffCtx(app, 'm-star-fin')
+  const shipStaff = staffCtx(app, 'm-star-ship')
+  const g3 = app.k.state.goods.find((g) => g.id === 'g3')
+  const stockBefore = g3.remain
+  const totalBefore = g3.stock
+
+  // RBAC：运营可发起，不能审批/验收
+  assert(app.auth.can(ops, 'purchase:apply') && !app.auth.can(ops, 'purchase:approve'), '运营：可发起采购，无审批权')
+  assert(!app.auth.can(ops, 'purchase:inbound') && app.auth.can(shipStaff, 'purchase:inbound'), '仓配：可验收入库')
+  assert(app.auth.can(fin, 'purchase:approve') && !app.auth.can(fin, 'purchase:inbound'), '财务：可审批，不可验收')
+
+  // 发起 → 审批 → 首批验收（30 件）→ 次批入满（20 件）
+  const po = await app.purchase.createOrder({ targetType: 'goods', targetId: 'g3', qty: 50, reason: '补货' }, ops)
+  assert(po.status === 'pending', '采购单创建：待审批')
+  let bad = null
+  try { await app.auth.requirePerm(ops, 'purchase:approve', 'purchase', '采购审批') } catch (e) { bad = e }
+  assert(bad instanceof BizError && bad.status === 403, '运营审批被 RBAC 拒绝（403）')
+  await app.purchase.reviewOrder(po.id, true, '预算内', fin)
+  const approved = app.k.state.purchaseOrders.find((x) => x.id === po.id)
+  assert(approved.status === 'approved' && g3.remain === stockBefore, '审批通过但库存不变')
+  const b1 = await app.purchase.inbound(po.id, { qty: 30, carrier: '供应商A' }, shipStaff)
+  assert(b1.batch.remainAfter === stockBefore + 30 && g3.remain === stockBefore + 30, '首批入库 30：remain 抬升')
+  assert(g3.stock === totalBefore + 30, '首批入库 30：stock 账面总量同步抬升')
+  const receiving = app.k.state.purchaseOrders.find((x) => x.id === po.id)
+  assert(receiving.status === 'receiving' && receiving.inboundQty === 30, '采购单 → 分批验收中')
+  let over = null
+  try { await app.purchase.inbound(po.id, { qty: 99 }, shipStaff) } catch (e) { over = e }
+  assert(over instanceof BizError && over.code === 'OVER_INBOUND', '超量验收被拦截（OVER_INBOUND）')
+  await app.purchase.inbound(po.id, { qty: 20 }, shipStaff)
+  const done = app.k.state.purchaseOrders.find((x) => x.id === po.id)
+  assert(done.status === 'received' && done.inboundQty === 50 && g3.remain === stockBefore + 50 && g3.stock === totalBefore + 50,
+    '次批入满 → 入库完成，remain/stock 共抬升 50')
+  let dup = null
+  try { await app.purchase.inbound(po.id, { qty: 1 }, shipStaff) } catch (e) { dup = e }
+  assert(dup instanceof BizError && dup.code === 'STATE_DENIED', '完结后重复验收被状态机拦截')
+  assert(app.k.state.inboundBatches.filter((b) => b.poId === po.id).length === 2, '两批验收写入 append-only 台账')
+
+  // 缺货补发：把 g3 账面调到「仅剩 1 件」（stock 与已消耗保持勾稽，不制造盘亏）→ 兑完 → 补发缺货
+  const consumedG3 = app.k.state.records.filter((r) => r.type === 'redeem' && r.goodsId === 'g3' && r.status !== 'revoked').length
+  await app.k.commit([{ type: 'upsert', table: 'goods', row: { ...g3, remain: 1, stock: consumedG3 + 1 } }])
+  const customer = customerCtx(app)
+  const r = await app.trade.redeem('g3', customer, { idempotencyKey: 'po-reship-1' })
+  const sp = await app.ship.createForRecord(app.k.state.records.find((x) => x.id === r.trade.id))
+  await app.ship.submitAddress(sp.shipment.id,
+    { receiver: '张三', phone: '13812345678', region: '上海市浦东新区', address: '张江路1号' }, customer)
+  await app.ship.ship(sp.shipment.id, { carrier: '顺丰', trackingNo: 'SF1' }, shipStaff)
+  await app.ship.receive(sp.shipment.id, customer)
+  const asRow = await app.ship.applyAfterSale(sp.shipment.id, 'reship', '少件补发', customer)
+  const g3Now = app.k.state.goods.find((g) => g.id === 'g3')
+  assert(g3Now.remain === 0, 'g3 兑完：remain=0')
+  const waiting = await app.ship.reviewAfterSale(asRow.id, true, '缺货挂起', shipStaff)
+  assert(waiting.status === 'waiting_stock', '补发缺货 → 售后单挂起待补货（不落账）')
+  // 从待补货售后发起采购
+  const po2 = await app.purchase.createOrder(
+    { targetType: 'goods', targetId: 'g3', qty: 10, reason: '补发采购', afterSaleId: asRow.id }, ops)
+  assert(po2.afterSaleId === asRow.id && po2.purpose === 'aftersale', '采购单关联待补货售后')
+  await app.purchase.reviewOrder(po2.id, true, '加急', fin)
+  const inb = await app.purchase.inbound(po2.id, { qty: 10 }, shipStaff)
+  assert(inb.resumeReady?.id === asRow.id, '入满后返回可继续履约的待补货售后单')
+  const cont = await app.ship.reviewAfterSale(asRow.id, true, '到货继续履约', shipStaff)
+  assert(cont.status === 'done' && !!cont.reshipmentId, '继续履约：售后单完成并生成补发单')
+  const g3Done = app.k.state.goods.find((g) => g.id === 'g3')
+  assert(g3Done.remain === 9 && g3Done.stock === 11, '入库 +10 后补发扣 1：remain=9、stock=11')
+  // P5 对账仍平
+  const diffs = app.recon.compute(app.k.todayDate(), 't-star')
+  assert(diffs.stock.filter((x) => x.diff !== 0).length === 0,
+    `采购入库 + 补发后 P5 账实相符（${diffs.stock.filter((x) => x.diff).length} SKU 差异）`)
+
+  // 重启：WAL 重放后采购单/批次/库存恢复，验收批次 effectId 不重复抬库存
+  const snap = { remain: g3Done.remain, stock: g3Done.stock, batches: app.k.state.inboundBatches.length }
+  await app.k.close()
+  app = await createApp({ dbFile: db, autoResume: false })
+  const g3Restored = app.k.state.goods.find((g) => g.id === 'g3')
+  assert(g3Restored.remain === snap.remain && g3Restored.stock === snap.stock,
+    `重启后库存恢复一致（remain ${g3Restored.remain}/${snap.remain}，stock ${g3Restored.stock}/${snap.stock}）`)
+  assert(app.k.state.inboundBatches.length === snap.batches, '验收批次随 WAL 完整恢复，重放不重复')
+  assert(app.k.state.purchaseOrders.filter((o) => ['received'].includes(o.status)).length >= 2, '采购单状态恢复')
+  await app.k.close()
+}
+
 async function main() {
   await testConcurrency()
   await testIdempotency()
   await testCrashResume()
   await testReleaseCrashAndCrossDay()
   await testRecon()
+  await testPurchase()
   await testRbac()
   await testWALRecovery()
   if (failed) {

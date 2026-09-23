@@ -115,6 +115,37 @@ async function main() {
   // 新券码为随机，先用列表拿到云雀码（星河财务查不到云雀券→视为不存在/404；这里仅断言非 200）
   assert(cross.status !== 200, `跨租户核销被拦截（${cross.status} ${cross.json?.error?.code}）`)
 
+  console.log('— 采购入库 API：RBAC + 发起/审批/分批验收全链路 —')
+  const opsToken = (await api('POST', '/api/auth/member-login', { body: { memberId: 'm-star-ops' } })).json.token
+  const finToken = (await api('POST', '/api/auth/member-login', { body: { memberId: 'm-star-fin' } })).json.token
+  // 运营无审批权 → 403
+  const createRes = await api('POST', '/api/purchases/create', {
+    token: opsToken, body: { targetType: 'goods', targetId: 'g3', qty: 10, reason: 'HTTP 采购补货' }
+  })
+  assert(createRes.status === 200 && createRes.json.purchase.status === 'pending', '运营发起采购成功')
+  const poId = createRes.json.purchase.id
+  const opsApprove = await api('POST', '/api/purchases/review', { token: opsToken, body: { purchaseId: poId, approve: true } })
+  assert(opsApprove.status === 403, '运营审批采购 403')
+  // 仓配无审批权；财务审批通过
+  const approveRes = await api('POST', '/api/purchases/review', { token: finToken, body: { purchaseId: poId, approve: true, note: '同意' } })
+  assert(approveRes.status === 200 && approveRes.json.purchase.status === 'approved', '财务审批通过')
+  // 财务不能验收 → 403
+  const finInbound = await api('POST', '/api/purchases/inbound', { token: finToken, body: { purchaseId: poId, qty: 10 } })
+  assert(finInbound.status === 403, '财务验收入库 403')
+  // 仓配分批验收：先 4 件（receiving），超量 99 拦截，再 6 件入满
+  const ib1 = await api('POST', '/api/purchases/inbound', { token: shipToken, body: { purchaseId: poId, qty: 4, carrier: '供应商X' } })
+  assert(ib1.status === 200 && ib1.json.order.status === 'receiving' && ib1.json.batch.qty === 4, '首批验收 4 件：receiving')
+  const over = await api('POST', '/api/purchases/inbound', { token: shipToken, body: { purchaseId: poId, qty: 99 } })
+  assert(over.status === 409 && over.json.error.code === 'OVER_INBOUND', '超量验收 409 OVER_INBOUND')
+  const ib2 = await api('POST', '/api/purchases/inbound', { token: shipToken, body: { purchaseId: poId, qty: 6 } })
+  assert(ib2.status === 200 && ib2.json.order.status === 'received', '次批 6 件入满：received')
+  const poList = await api('GET', '/api/purchases', { token: shipToken })
+  assert(poList.json.purchases.some((o) => o.id === poId && o.inboundQty === 10), 'GET /api/purchases 返回采购单与累计入库量')
+  assert(poList.json.batches.filter((b) => b.poId === poId).length === 2, '采购批次台账 2 条')
+  // 重复验收 → 409
+  const ibDup = await api('POST', '/api/purchases/inbound', { token: shipToken, body: { purchaseId: poId, qty: 1 } })
+  assert(ibDup.status === 409, '入库完成后重复验收 409')
+
   console.log('— 故障注入 → 重启 → 启动自动续办 —')
   // 平台在抽奖扣分后注入故障，触发一次 act-2 抽奖（10 积分）应返回 500
   await api('POST', '/api/admin/fault', { token: pToken, body: { name: 'draw.afterCost' } })

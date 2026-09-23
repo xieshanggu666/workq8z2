@@ -19,8 +19,8 @@ const sp2 = s.shipments.find((o) => o.id === 'seed-sp2')
 assert(sp1 && sp1.status === 'shipped', '种子：500元购物卡已发货（待用户确认收货）')
 assert(sp1.traces.length === 3 && sp1.traces[2].stage === 'delivering', '种子：购物卡物流轨迹已同步至派送中')
 assert(sp2 && sp2.status === 'pending_address', '种子：定制帆布袋待填写收货信息')
-assert(s.shipmentStats.total === 4 && s.shipmentStats.shipped === 1 && s.shipmentStats.pendingAddress === 1 &&
-  s.shipmentStats.received === 1 && s.shipmentStats.returned === 1,
+assert(s.shipmentStats.total === 6 && s.shipmentStats.shipped === 1 && s.shipmentStats.pendingAddress === 1 &&
+  s.shipmentStats.received === 3 && s.shipmentStats.returned === 1,
   `发货看板统计正确（${JSON.stringify(s.shipmentStats)}）`)
 assert(s.myShipTodoCount === 2, `用户待办角标=2（实际 ${s.myShipTodoCount}：待填地址+待收货）`)
 assert(s.pendingShipCount === 0, `运营待发货角标=0（地址未提交，实际 ${s.pendingShipCount}）`)

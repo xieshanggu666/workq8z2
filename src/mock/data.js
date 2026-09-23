@@ -118,7 +118,9 @@ export const SHOP_GOODS = [
   { id: 'g2', name: '视频会员周卡', cost: 80, icon: '🎬', stock: 100, remain: 100, physical: false, couponId: 'c-video-week' },
   { id: 'g3', name: '定制帆布袋', cost: 150, icon: '👜', stock: 50, remain: 50, physical: true },
   { id: 'g4', name: '盲盒福袋', cost: 200, icon: '🎁', stock: 30, remain: 30, physical: true },
-  { id: 'g5', name: '与牛人共进午餐', cost: 500, icon: '🍽️', stock: 5, remain: 5, physical: false }
+  { id: 'g5', name: '与牛人共进午餐', cost: 500, icon: '🍽️', stock: 5, remain: 5, physical: false },
+  // 限量实物：种子中 2 件已兑完（其中 1 笔补发售后因缺货挂起，等待采购入库后继续履约）
+  { id: 'g6', name: '限量联名公仔', cost: 300, icon: '🧸', stock: 2, remain: 2, physical: true }
 ]
 
 export const DEMO_USER = {

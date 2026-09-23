@@ -174,8 +174,8 @@ export class ShipService {
     if (!labels[type]) throw new BizError('BAD_TYPE', '不支持的售后类型')
     const allow = { reject: ['shipped'], return: ['received'], reship: ['shipped', 'received'] }[type]
     if (!allow.includes(o.status)) throw new BizError('STATE_DENIED', `当前状态不可申请${labels[type]}`, 409)
-    if (this.k.state.afterSales.some((a) => a.shipmentId === shipmentId && a.status === 'pending')) {
-      throw new BizError('IDEMPOTENT', '该发货单已有待审核的售后申请，请勿重复提交', 409)
+    if (this.k.state.afterSales.some((a) => a.shipmentId === shipmentId && (a.status === 'pending' || a.status === 'waiting_stock'))) {
+      throw new BizError('IDEMPOTENT', '该发货单已有待处理（待审核/待补货）的售后申请，请勿重复提交', 409)
     }
     if (this.k.state.afterSales.some((a) => a.shipmentId === shipmentId && a.status === 'done' && a.type === type)) {
       throw new BizError('IDEMPOTENT', `该发货单已完成过${labels[type]}售后，不可重复申请`, 409)
@@ -206,12 +206,15 @@ export class ShipService {
   async reviewAfterSale(afterSaleId, approve, note, ctx) {
     const as = this.k.state.afterSales.find((x) => x.id === afterSaleId)
     if (!as) throw new BizError('AS_NOT_FOUND', '售后单不存在', 404)
-    if (as.status !== 'pending') throw new BizError('IDEMPOTENT', '该售后单已处理，请勿重复操作', 409)
+    // waiting_stock：采购入库后的「继续履约」入口，仅补发单、仅同意继续可执行
+    const continuing = as.status === 'waiting_stock'
+    if (as.status !== 'pending' && !continuing) throw new BizError('IDEMPOTENT', '该售后单已处理，请勿重复操作', 409)
     const o = this.requireShipment(as.shipmentId)
     const remark = (note || '').trim()
     const traceId = as.traceId || this.k.newTraceId()
 
     if (!approve) {
+      if (continuing) throw new BizError('STATE_DENIED', '待补货售后单仅可在采购入库后继续履约，不能驳回', 409)
       const row = { ...as, status: 'dismissed', reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`, reviewer: ctx.name, reviewNote: remark }
       await this.k.commit([{ type: 'upsert', table: 'afterSales', row }])
       await this.audit.log('aftersale-dismiss', as.id,
@@ -223,7 +226,19 @@ export class ShipService {
     // 通过：统一预校验（库存目标存在；补发需有余量），任一不满足整体不落账
     const target = this.inventory.targetOf(as.targetType, as.activityId, as.targetId)
     if (as.type === 'reship' && target.row.remain <= 0) {
-      throw new BizError('OUT_OF_STOCK', `补发失败：【${as.targetName}】库存不足，请先补货或驳回该申请`, 409)
+      // 缺货：售后单挂起「待补货」（不动账），采购验收入库后可从待处理售后继续履约
+      const row = {
+        ...as,
+        status: 'waiting_stock',
+        reviewedAt: `${this.k.todayDate()} ${this.k.nowTime()}`,
+        reviewer: ctx.name, reviewNote: remark,
+        shortageNote: `审核通过但【${as.targetName}】库存不足（remain=0），挂起待采购补货后继续履约`
+      }
+      await this.k.commit([{ type: 'upsert', table: 'afterSales', row }])
+      await this.audit.log('aftersale-shortage', as.id,
+        `补发【${as.targetName}】库存不足，售后单转待补货（发货单 ${o.id}，账目与库存未变动）；请发起采购，验收入库后从待处理售后继续履约`,
+        { tenantId: as.tenantId, ctx, traceId })
+      return row
     }
 
     if (as.type === 'reject' || as.type === 'return') {
@@ -267,7 +282,7 @@ export class ShipService {
     await this.k.commit([{ type: 'upsert', table: 'afterSales', row: doneRow }])
     await this.audit.log('aftersale-approve', as.id,
       as.type === 'reship'
-        ? `同意补发【${as.targetName}】：库存扣减 1，生成补发单 ${doneRow.reshipmentId}${remark ? '；备注：' + remark : ''}`
+        ? `${continuing ? '采购入库后继续履约：' : ''}同意补发【${as.targetName}】：库存扣减 1，生成补发单 ${doneRow.reshipmentId}${remark ? '；备注：' + remark : ''}`
         : `同意${as.typeLabel}【${as.targetName}】：库存回补 1${as.refundPoints ? `、返还 ${as.refundPoints} 积分` : ''}，发货单 ${o.id} 已退回${remark ? '；备注：' + remark : ''}`,
       { tenantId: as.tenantId, ctx, traceId })
     return doneRow

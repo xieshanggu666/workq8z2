@@ -23,6 +23,7 @@ export class Kernel {
       records: [], riskOrders: [], taskClaims: [],
       coupons: [], couponLogs: [],
       shipments: [], afterSales: [],
+      purchaseOrders: [], inboundBatches: [],
       reconBills: [], stockAdjustments: [],
       auditLogs: [],
       migrations: [],      // 历史台账迁移批次（manifest；幂等判重 + 校验和留痕）
@@ -138,6 +139,7 @@ export class Kernel {
         if (target) {
           target.row.remain += e.dRemain
           target.row.frozen = (target.row.frozen || 0) + e.dFrozen
+          if (e.dStock) target.row.stock = (target.row.stock || 0) + e.dStock
         }
         break
       }

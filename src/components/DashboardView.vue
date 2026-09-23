@@ -122,6 +122,31 @@
         <div class="s-num" style="color:#82b1ff">{{ store.dashboard.shipReshipped }}</div>
         <div class="s-lab">补发发货单</div>
       </div>
+      <div class="stat-card aftersale">
+        <span class="s-icon">⏳</span>
+        <div class="s-num" style="color:#ef9a9a">{{ store.dashboard.afterSaleWaiting }}</div>
+        <div class="s-lab">售后待补货</div>
+      </div>
+      <div class="stat-card purchase">
+        <span class="s-icon">🛒</span>
+        <div class="s-num warn">{{ store.dashboard.purchasePending }}</div>
+        <div class="s-lab">采购待审批</div>
+      </div>
+      <div class="stat-card purchase">
+        <span class="s-icon">📥</span>
+        <div class="s-num" style="color:#82b1ff">{{ store.dashboard.purchaseToInbound }}</div>
+        <div class="s-lab">采购待入库</div>
+      </div>
+      <div class="stat-card purchase">
+        <span class="s-icon">✅</span>
+        <div class="s-num ok">{{ store.dashboard.purchaseReceived }}</div>
+        <div class="s-lab">采购入库完成</div>
+      </div>
+      <div class="stat-card purchase">
+        <span class="s-icon">📈</span>
+        <div class="s-num purchase-n">{{ store.dashboard.purchaseInboundQty }}</div>
+        <div class="s-lab">累计验收入库</div>
+      </div>
       <div class="stat-card coupon">
         <span class="s-icon">🎟️</span>
         <div class="s-num coupon-n">{{ store.dashboard.couponIssued }}</div>
@@ -245,10 +270,12 @@ const scopedRecords = computed(() =>
 .stat-card.risk { border-color: rgba(255,152,0,0.35); }
 .stat-card.recon { border-color: rgba(77,182,172,0.35); }
 .stat-card.ship { border-color: rgba(76,175,80,0.35); }
+.stat-card.purchase { border-color: rgba(142,36,170,0.4); }
 .stat-card.coupon { border-color: rgba(171,71,188,0.4); }
 .stat-card.aftersale { border-color: rgba(255,204,128,0.4); }
 .s-num.recon-n { color: #4db6ac; }
 .s-num.coupon-n { color: #ce93d8; }
+.s-num.purchase-n { color: #ce93d8; }
 .s-num.warn { color: #ffb74d; }
 .s-num.ice { color: #81d4fa; }
 .s-num.ok { color: #7ef0c9; }
